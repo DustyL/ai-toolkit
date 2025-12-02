@@ -191,7 +191,7 @@ class Flux2Model(BaseModel):
                 offload_percent=self.model_config.layer_offloading_text_encoder_percent,
             )
 
-        tokenizer = AutoProcessor.from_pretrained(MISTRAL_PATH)
+        tokenizer = AutoProcessor.from_pretrained(MISTRAL_PATH, fix_mistral_regex=True)
 
         self.print_and_status_update("Loading VAE")
         vae_path = self.model_config.vae_path
