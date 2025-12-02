@@ -628,8 +628,7 @@ class ModelConfig:
         
         # splits the model over the available gpus
         self.split_model_over_gpus = kwargs.get("split_model_over_gpus", False)
-        if self.split_model_over_gpus and not (self.is_flux or self.is_flux2):
-            raise ValueError("split_model_over_gpus is only supported with flux and flux2 models currently")
+        # Note: validation for split_model_over_gpus moved to after arch processing (see below)
         self.split_model_other_module_param_count_scale = kwargs.get("split_model_other_module_param_count_scale", 0.3)
         
         self.te_name_or_path = kwargs.get("te_name_or_path", None)
@@ -731,7 +730,10 @@ class ModelConfig:
                 self.arch = 'ssd'
             else:
                 self.arch = 'sd1'
-        
+
+        # Validate split_model_over_gpus after arch processing (is_flux/is_flux2 are now set)
+        if self.split_model_over_gpus and not (self.is_flux or self.is_flux2):
+            raise ValueError("split_model_over_gpus is only supported with flux and flux2 models currently")
 
 
 class EMAConfig:
