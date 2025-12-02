@@ -184,6 +184,14 @@ class ToolkitModuleMixin:
             if torch.rand(1) < self.module_dropout:
                 return 0.0  # added to original forward
 
+        # Sync LoRA weights to input device if needed (for multi-GPU model splitting)
+        # This happens once per LoRA module when device mismatch is detected
+        if x.device != self.lora_down.weight.device:
+            self.lora_down = self.lora_down.to(x.device)
+            self.lora_up = self.lora_up.to(x.device)
+            if hasattr(self, 'lora_mid') and self.lora_mid is not None:
+                self.lora_mid = self.lora_mid.to(x.device)
+
         if hasattr(self, 'lora_mid') and self.lora_mid is not None:
             lx = self.lora_mid(self.lora_down(x))
         else:
