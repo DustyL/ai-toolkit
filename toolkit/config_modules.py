@@ -553,7 +553,7 @@ class TrainConfig:
         self.switch_boundary_every: int = kwargs.get('switch_boundary_every', 1)
 
 
-ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
+ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flux2', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
 
 
 class ModelConfig:
@@ -568,6 +568,7 @@ class ModelConfig:
         self.is_auraflow: bool = kwargs.get('is_auraflow', False)
         self.is_v3: bool = kwargs.get('is_v3', False)
         self.is_flux: bool = kwargs.get('is_flux', False)
+        self.is_flux2: bool = kwargs.get('is_flux2', False)
         self.is_lumina2: bool = kwargs.get('is_lumina2', False)
         if self.is_pixart_sigma:
             self.is_pixart = True
@@ -625,10 +626,10 @@ class ModelConfig:
         self.only_if_contains: Optional[List[str]] = kwargs.get("only_if_contains", None)
         self.quantize_kwargs = kwargs.get("quantize_kwargs", {})
         
-        # splits the model over the available gpus WIP
+        # splits the model over the available gpus
         self.split_model_over_gpus = kwargs.get("split_model_over_gpus", False)
-        if self.split_model_over_gpus and not self.is_flux:
-            raise ValueError("split_model_over_gpus is only supported with flux models currently")
+        if self.split_model_over_gpus and not (self.is_flux or self.is_flux2):
+            raise ValueError("split_model_over_gpus is only supported with flux and flux2 models currently")
         self.split_model_other_module_param_count_scale = kwargs.get("split_model_other_module_param_count_scale", 0.3)
         
         self.te_name_or_path = kwargs.get("te_name_or_path", None)
@@ -695,6 +696,8 @@ class ModelConfig:
                 self.is_auraflow = True
             elif self.arch == 'flux':
                 self.is_flux = True
+            elif self.arch == 'flux2':
+                self.is_flux2 = True
             elif self.arch == 'lumina2':
                 self.is_lumina2 = True
             elif self.arch == 'vega':
@@ -718,6 +721,8 @@ class ModelConfig:
                 self.arch = 'auraflow'
             elif kwargs.get('is_flux', False):
                 self.arch = 'flux'
+            elif kwargs.get('is_flux2', False):
+                self.arch = 'flux2'
             elif kwargs.get('is_lumina2', False):
                 self.arch = 'lumina2'
             elif kwargs.get('is_vega', False):

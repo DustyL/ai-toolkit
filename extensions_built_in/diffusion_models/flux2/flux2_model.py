@@ -22,6 +22,7 @@ from transformers import AutoProcessor, Mistral3ForConditionalGeneration
 from .src.model import Flux2, Flux2Params
 from .src.pipeline import Flux2Pipeline
 from .src.autoencoder import AutoEncoder, AutoEncoderParams
+from .flux2_gpu_splitter import add_model_gpu_splitter_to_flux2
 from safetensors.torch import load_file, save_file
 from PIL import Image
 import torch.nn.functional as F
@@ -116,6 +117,25 @@ class Flux2Model(BaseModel):
             transformer_state_dict[key] = transformer_state_dict[key].to(dtype)
 
         transformer.load_state_dict(transformer_state_dict, assign=True)
+
+        # Apply GPU model splitting if enabled (must be before any .to() calls)
+        if self.model_config.split_model_over_gpus:
+            # Warn about incompatible options
+            if self.model_config.low_vram:
+                print("Warning: low_vram is not compatible with split_model_over_gpus, disabling low_vram")
+                self.model_config.low_vram = False
+            if self.model_config.layer_offloading:
+                print("Warning: layer_offloading is not compatible with split_model_over_gpus, disabling layer_offloading")
+                self.model_config.layer_offloading = False
+            if self.model_config.quantize:
+                print("Warning: quantize is not compatible with split_model_over_gpus, disabling quantize")
+                self.model_config.quantize = False
+
+            self.print_and_status_update("Applying GPU model splitting")
+            add_model_gpu_splitter_to_flux2(
+                transformer,
+                other_module_param_count_scale=self.model_config.split_model_other_module_param_count_scale
+            )
 
         transformer.to(self.quantize_device, dtype=dtype)
 
