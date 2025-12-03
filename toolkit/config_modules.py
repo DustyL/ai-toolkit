@@ -630,7 +630,9 @@ class ModelConfig:
         self.split_model_over_gpus = kwargs.get("split_model_over_gpus", False)
         # Note: validation for split_model_over_gpus moved to after arch processing (see below)
         self.split_model_other_module_param_count_scale = kwargs.get("split_model_other_module_param_count_scale", 0.3)
-        
+        # Split strategy: "contiguous" (default, fewer cross-GPU transfers) or "greedy" (param-balanced but interleaved)
+        self.split_model_strategy = kwargs.get("split_model_strategy", "contiguous")
+
         self.te_name_or_path = kwargs.get("te_name_or_path", None)
         
         self.arch: ModelArch = kwargs.get("arch", None)

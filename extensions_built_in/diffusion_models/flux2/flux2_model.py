@@ -134,7 +134,8 @@ class Flux2Model(BaseModel):
             self.print_and_status_update("Applying GPU model splitting")
             add_model_gpu_splitter_to_flux2(
                 transformer,
-                other_module_param_count_scale=self.model_config.split_model_other_module_param_count_scale
+                other_module_param_count_scale=self.model_config.split_model_other_module_param_count_scale,
+                split_strategy=self.model_config.split_model_strategy
             )
 
         transformer.to(self.quantize_device, dtype=dtype)

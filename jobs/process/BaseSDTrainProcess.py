@@ -2229,6 +2229,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if not did_first_flush:
                 flush()
                 did_first_flush = True
+            # If we hit OOM, skip the rest of this iteration safely.
+            if did_oom:
+                continue
             # flush()
             # setup the networks to gradient checkpointing and everything works
             if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
@@ -2237,7 +2240,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with torch.no_grad():
                 # torch.cuda.empty_cache()
                 # if optimizer has get_lrs method, then use it
-                if not did_oom and loss_dict is not None:
+                if loss_dict is not None:
                     if hasattr(optimizer, 'get_avg_learning_rate'):
                         learning_rate = optimizer.get_avg_learning_rate()
                     elif hasattr(optimizer, 'get_learning_rates'):

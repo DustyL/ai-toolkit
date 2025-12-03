@@ -10,7 +10,8 @@ but adapted for the FLUX.2 architecture which has different block structures.
 FLUX.2 Architecture:
 - 8 double blocks (DoubleStreamBlock): Process image and text streams separately
 - 48 single blocks (SingleStreamBlock): Process concatenated img+txt stream
-- Total: ~12B transformer parameters
+- Transformer: ~12B parameters
+- Full model with Mistral TE: ~32B parameters total
 """
 
 from functools import partial
@@ -229,25 +230,40 @@ def add_model_gpu_splitter_to_flux2(
     # Estimated params for text encoder (~24B), VAE (~0.5B), and misc
     other_module_params: Optional[int] = 25e9,
     # Scale down non-trainable params in distribution calculation
-    other_module_param_count_scale: Optional[float] = 0.3
+    other_module_param_count_scale: Optional[float] = 0.3,
+    # Split strategy: "contiguous" (default) or "greedy"
+    split_strategy: Optional[str] = "contiguous"
 ):
     """
     Apply GPU model splitting to a Flux2 transformer.
 
-    Distributes transformer blocks across all available GPUs based on parameter count.
-    The algorithm greedily assigns blocks to GPUs until each GPU reaches its fair share
-    of parameters.
+    Distributes transformer blocks across available GPUs. Double blocks (8 total) are
+    always pinned to GPU 0 to avoid mid-forward transfers. Only single blocks (48 total)
+    are distributed across GPUs.
+
+    Split Strategies:
+        - "contiguous" (default): Finds optimal split point within single blocks to
+          create consecutive ranges per GPU. Guarantees exactly 2 cross-GPU transfers:
+          one at the split point, one returning to GPU 0 for final_layer.
+
+        - "greedy": Assigns each single block to the GPU with lowest current param total.
+          Can cause interleaved assignments with many cross-GPU transfers (~20-30 per
+          forward pass). Only use for edge cases where one GPU is much slower or has
+          different memory constraints.
 
     Args:
         transformer: The Flux2 model to split
         other_module_params: Estimated parameter count for non-transformer modules
                            (text encoder, VAE, etc.) that share GPU 0
-        other_module_param_count_scale: Multiplier for other_module_params since
-                                       they may not all be on GPU during training
+        other_module_param_count_scale: Multiplier for other_module_params. Applied
+                                       only to GPU 0's starting load when computing
+                                       the split point. Use 0.0 to ignore TE/VAE weight.
+        split_strategy: "contiguous" (default) or "greedy"
 
-    Memory Distribution Example (2x B200 with FLUX.2):
-        GPU 0: Mistral TE (~48GB) + VAE (~0.5GB) + embedders + ~4 double + ~24 single (~96GB)
-        GPU 1: ~4 double blocks + ~24 single blocks (~48GB)
+    Memory Distribution Example (2x B200 with FLUX.2, contiguous, scale=0.0):
+        GPU 0: Mistral TE + VAE + embedders + 8 double + ~20 single blocks
+        GPU 1: ~28 single blocks
+        Transfers: 1 (at single split point) + 1 (back to GPU 0 for final_layer) = 2 total
 
     With gradient_checkpointing=false, activations are distributed across GPUs too.
     """
@@ -257,20 +273,27 @@ def add_model_gpu_splitter_to_flux2(
         print("Warning: Only 1 GPU detected, GPU splitting will have no effect")
         return
 
-    print(f"[GPU Splitter] Splitting FLUX.2 model across {len(gpu_id_list)} GPUs")
+    # Validate split_strategy
+    if split_strategy not in ("contiguous", "greedy"):
+        print(f"[GPU Splitter] Warning: Unknown split_strategy '{split_strategy}', using 'contiguous' instead")
+        split_strategy = "contiguous"
 
-    # Scale other module params (they're not all on GPU during training)
-    other_module_params = other_module_params * other_module_param_count_scale
+    print(f"[GPU Splitter] Splitting FLUX.2 model across {len(gpu_id_list)} GPUs (strategy: {split_strategy})")
 
-    # Calculate total params for distribution
-    total_params = sum(p.numel() for p in transformer.parameters()) + other_module_params
-    params_per_gpu = total_params / len(gpu_id_list)
+    # Contiguous strategy only supports 2 GPUs; fall back to greedy for >2
+    if len(gpu_id_list) > 2 and split_strategy == "contiguous":
+        print("[GPU Splitter] WARNING: Contiguous strategy only supports 2 GPUs. "
+              f"Falling back to 'greedy' for {len(gpu_id_list)} GPUs.")
+        print("[GPU Splitter] HINT: For 3+ GPUs, consider FSDP/DeepSpeed data parallelism for better scaling. "
+              "Greedy model splitting is a stopgap with high transfer overhead.")
+        split_strategy = "greedy"
 
-    print(f"[GPU Splitter] Total params: {total_params/1e9:.2f}B, Target per GPU: {params_per_gpu/1e9:.2f}B")
+    # Scale other module params (applied to GPU 0's starting load)
+    gpu0_starting_load = other_module_params * other_module_param_count_scale
 
-    current_gpu_idx = 0
-    # GPU 0 starts with non-block params (embeddings, text encoder, VAE)
-    current_gpu_params = other_module_params
+    # Track per-GPU param totals (start with TE/VAE estimate on GPU 0)
+    gpu_param_totals = {i: 0 for i in gpu_id_list}
+    gpu_param_totals[0] = gpu0_starting_load
 
     # Track block distribution for logging
     block_distribution = {i: {"double": 0, "single": 0} for i in gpu_id_list}
@@ -293,47 +316,127 @@ def add_model_gpu_splitter_to_flux2(
     for block in transformer.single_blocks:
         _reset_block(block)
 
-    # Apply splitting to double blocks (8 blocks)
-    for double_block in transformer.double_blocks:
-        device = torch.device(f"cuda:{current_gpu_idx}")
+    # Pre-calculate block params
+    double_params_list = [sum(p.numel() for p in b.parameters()) for b in transformer.double_blocks]
+    single_params_list = [sum(p.numel() for p in b.parameters()) for b in transformer.single_blocks]
 
-        # Store original forward and wrap with device-aware version
-        double_block._pre_gpu_split_forward = double_block.forward
-        double_block.forward = partial(split_gpu_double_block_forward, double_block)
-        double_block._split_device = device
+    total_double_params = sum(double_params_list)
+    total_single_params = sum(single_params_list)
+    total_block_params = total_double_params + total_single_params
 
-        block_distribution[current_gpu_idx]["double"] += 1
+    print(f"[GPU Splitter] Total block params: {total_block_params/1e9:.2f}B "
+          f"({total_double_params/1e9:.2f}B double + {total_single_params/1e9:.2f}B single)")
+    print(f"[GPU Splitter] GPU0 extra load (TE/VAE estimate): {gpu0_starting_load/1e9:.2f}B "
+          f"(only GPU0 carries this, affects split point calculation)")
 
-        # Add block params to current GPU total
-        current_gpu_params += sum(p.numel() for p in double_block.parameters())
+    # ============ ALWAYS PIN DOUBLE BLOCKS TO GPU 0 ============
+    # Double blocks (8 total) process both img and txt streams and come first in the forward pass.
+    # Pinning them to GPU0 guarantees exactly one transfer point (at the double→single boundary
+    # or within singles), avoiding mid-double transfers that would add extra communication.
+    gpu0_device = torch.device("cuda:0")
 
-        # Move to next GPU if threshold exceeded
-        if current_gpu_params > params_per_gpu:
-            current_gpu_idx += 1
-            current_gpu_params = 0
-            if current_gpu_idx >= len(gpu_id_list):
-                current_gpu_idx = gpu_id_list[-1]
+    for i, block in enumerate(transformer.double_blocks):
+        block._pre_gpu_split_forward = block.forward
+        block.forward = partial(split_gpu_double_block_forward, block)
+        block._split_device = gpu0_device
 
-    # Apply splitting to single blocks (48 blocks)
-    for single_block in transformer.single_blocks:
-        device = torch.device(f"cuda:{current_gpu_idx}")
+        block_distribution[0]["double"] += 1
+        gpu_param_totals[0] += double_params_list[i]
 
-        # Store original forward and wrap with device-aware version
-        single_block._pre_gpu_split_forward = single_block.forward
-        single_block.forward = partial(split_gpu_single_block_forward, single_block)
-        single_block._split_device = device
+    if split_strategy == "contiguous":
+        # ============ CONTIGUOUS STRATEGY ============
+        # Find optimal split point within single blocks only.
+        # Guarantees exactly 1 transfer (at split) + 1 return (to final_layer on GPU0) = 2 total.
 
-        block_distribution[current_gpu_idx]["single"] += 1
+        # Handle edge case: no single blocks (unlikely but defensive)
+        if not single_params_list:
+            print("[GPU Splitter] WARNING: No single blocks found, all work on GPU0")
+            split_idx = 0
+            best_diff = 0.0
+        else:
+            # GPU 0 already has: TE/VAE + all doubles
+            # Find the split point that minimizes |params_gpu0 - params_gpu1|
+            gpu0_base = gpu0_starting_load + total_double_params
 
-        # Add block params to current GPU total
-        current_gpu_params += sum(p.numel() for p in single_block.parameters())
+            # Compute cumulative sums for singles
+            single_cumsum = []
+            running = 0
+            for params in single_params_list:
+                running += params
+                single_cumsum.append(running)
 
-        # Move to next GPU if threshold exceeded
-        if current_gpu_params > params_per_gpu:
-            current_gpu_idx += 1
-            current_gpu_params = 0
-            if current_gpu_idx >= len(gpu_id_list):
-                current_gpu_idx = gpu_id_list[-1]
+            # Find split index that minimizes imbalance: O(N) scan over N+1 possible split points
+            # split_idx=k means singles[0:k] on GPU0, singles[k:] on GPU1
+            best_split_idx = 0
+            best_diff = float('inf')
+
+            for k in range(len(single_params_list) + 1):
+                if k == 0:
+                    gpu0_total = gpu0_base
+                    gpu1_total = total_single_params
+                else:
+                    gpu0_total = gpu0_base + single_cumsum[k - 1]
+                    gpu1_total = total_single_params - single_cumsum[k - 1]
+
+                diff = abs(gpu0_total - gpu1_total)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_split_idx = k
+
+            split_idx = best_split_idx
+
+        # Assign single blocks contiguously
+        for i, block in enumerate(transformer.single_blocks):
+            if i < split_idx:
+                current_gpu_idx = 0
+            else:
+                # For >2 GPUs, could extend to find multiple split points
+                # For now, all remaining go to GPU 1
+                current_gpu_idx = min(len(gpu_id_list) - 1, 1)
+
+            device = torch.device(f"cuda:{current_gpu_idx}")
+
+            block._pre_gpu_split_forward = block.forward
+            block.forward = partial(split_gpu_single_block_forward, block)
+            block._split_device = device
+
+            block_distribution[current_gpu_idx]["single"] += 1
+            gpu_param_totals[current_gpu_idx] += single_params_list[i]
+
+        # Log split details with percentage
+        num_singles = len(transformer.single_blocks)
+        total_distributed = total_block_params + gpu0_starting_load
+        imbalance_pct = (best_diff / total_distributed * 100) if total_distributed > 0 else 0.0
+
+        if split_idx == 0:
+            print(f"[GPU Splitter] Contiguous split: all {num_singles} singles on GPU1 "
+                  f"(imbalance: {best_diff/1e9:.2f}B, {imbalance_pct:.1f}%)")
+        elif split_idx == num_singles:
+            print(f"[GPU Splitter] Contiguous split: all {num_singles} singles on GPU0 "
+                  f"(imbalance: {best_diff/1e9:.2f}B, {imbalance_pct:.1f}%)")
+        else:
+            print(f"[GPU Splitter] Contiguous split: singles 0-{split_idx-1} on GPU0, "
+                  f"{split_idx}-{num_singles-1} on GPU1 (imbalance: {best_diff/1e9:.2f}B, {imbalance_pct:.1f}%)")
+
+    else:
+        # ============ GREEDY STRATEGY ============
+        # Assigns each single block to GPU with lowest current param total.
+        # WARNING: Can cause interleaved assignments with many cross-GPU transfers.
+        # Only use for edge cases (asymmetric GPUs, memory constraints).
+
+        print("[GPU Splitter] WARNING: Greedy strategy may cause 20-30+ cross-GPU transfers per forward pass")
+
+        for i, block in enumerate(transformer.single_blocks):
+            # Pick GPU with lowest current param total
+            current_gpu_idx = min(gpu_param_totals, key=gpu_param_totals.get)
+            device = torch.device(f"cuda:{current_gpu_idx}")
+
+            block._pre_gpu_split_forward = block.forward
+            block.forward = partial(split_gpu_single_block_forward, block)
+            block._split_device = device
+
+            block_distribution[current_gpu_idx]["single"] += 1
+            gpu_param_totals[current_gpu_idx] += single_params_list[i]
 
     # Force last single block to route output back to GPU 0
     # This is where final_layer expects the output
@@ -346,6 +449,7 @@ def add_model_gpu_splitter_to_flux2(
     # Log distribution
     print("[GPU Splitter] Block distribution:")
     for gpu_id, counts in block_distribution.items():
-        print(f"  GPU {gpu_id}: {counts['double']} double blocks, {counts['single']} single blocks")
+        params_b = gpu_param_totals[gpu_id] / 1e9
+        print(f"  GPU {gpu_id}: {counts['double']} double + {counts['single']} single blocks ({params_b:.2f}B params)")
 
     print("[GPU Splitter] FLUX.2 model splitting complete")

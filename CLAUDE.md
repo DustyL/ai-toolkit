@@ -83,3 +83,55 @@ FLUX.1-dev/schnell, Stable Diffusion 1.5/2.x/XL/3.5, WAN 2.1/2.2, Chroma, OmniGe
 - Images auto-resize and bucket by aspect ratio
 - Use `[trigger]` in captions to auto-replace with trigger word
 - Supports masked loss training via `mask_path` config
+
+## FLUX.2 Multi-GPU Training (2xB200)
+
+### GPU Model Splitting
+FLUX.2 supports model parallelism via `split_model_over_gpus`. The transformer blocks are distributed across available GPUs:
+- **GPU 0**: Text encoder (Mistral ~24B) + VAE + embeddings + ~50% transformer blocks
+- **GPU 1+**: Remaining transformer blocks
+
+Implementation: `extensions_built_in/diffusion_models/flux2/flux2_gpu_splitter.py`
+
+### Key Config for Multi-GPU
+```yaml
+model:
+  arch: flux2
+  split_model_over_gpus: true
+  split_model_strategy: contiguous  # "contiguous" (default, 2 transfers) or "greedy" (20+ transfers)
+  split_model_other_module_param_count_scale: 0.3  # Lower = more blocks on GPU 0
+  quantize: false      # Incompatible with GPU splitting
+  low_vram: false      # Incompatible with GPU splitting
+  layer_offloading: false  # Incompatible with GPU splitting
+
+train:
+  gradient_checkpointing: false  # Safe to disable with splitting (20-30% faster)
+  batch_size: 3-4               # Higher batch size possible with distributed memory
+  dtype: bf16
+  attention_backend: flash
+```
+
+### Split Strategies
+- **contiguous** (default, 2 GPUs only): Double blocks pinned to GPU0, single blocks split at optimal min-diff point. Exactly 2 cross-GPU transfers per forward pass. Best for 2xB200.
+- **greedy**: Double blocks on GPU0, single blocks assigned to GPU with lowest params (can interleave). Causes 20-30+ transfers per forward. Auto-fallback for >2 GPUs.
+
+**Note**: With >2 GPUs, contiguous auto-falls back to greedy with a warning. For 3+ GPU scaling, consider FSDP/DeepSpeed data parallelism instead of model splitting.
+
+### Running Multi-GPU Training
+```bash
+# Activate venv first
+source venv/bin/activate
+
+# Run FLUX.2 multi-GPU training
+python run.py config/FLUX2-DLAY-multigpu.yaml
+
+# Monitor GPUs during training
+watch -n 1 nvidia-smi
+```
+
+### B200 Optimization Notes
+- Use `dtype: bf16` throughout (native B200 support)
+- Disable gradient checkpointing when using GPU splitting
+- `cache_latents_to_disk: true` recommended for large datasets
+- Flash attention backend works well on B200
+- Batch size 3-4 achievable with 2x B200 (384GB total)
