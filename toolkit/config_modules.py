@@ -159,7 +159,7 @@ class LoRMConfig:
         })
 
 
-NetworkType = Literal['lora', 'locon', 'lorm', 'lokr']
+NetworkType = Literal['lora', 'locon', 'lorm', 'lokr', 'loha', 'dora', 'boft', 'diag-oft']
 
 
 class NetworkConfig:
@@ -205,6 +205,30 @@ class NetworkConfig:
             self.conv_alpha = 9999999999
         # -1 automatically finds the largest factor
         self.lokr_factor = kwargs.get('lokr_factor', -1)
+        # Advanced LyCORIS parameters
+        # DoRA-style weight decomposition (works with lokr, loha)
+        self.weight_decompose = kwargs.get('weight_decompose', False)
+        # Direction of weight decomposition (True = output, False = input)
+        self.wd_on_out = kwargs.get('wd_on_out', True)
+        # Trainable scalar for weight difference
+        self.use_scalar = kwargs.get('use_scalar', False)
+        # Tucker decomposition for conv layers (loha, lokr)
+        self.use_tucker = kwargs.get('use_tucker', False)
+        # Rank-stabilized LoRA scaling (scale by sqrt(rank) instead of rank)
+        self.rs_lora = kwargs.get('rs_lora', False)
+        # Decompose both matrices in LoKr
+        self.decompose_both = kwargs.get('decompose_both', False)
+        # Scale rank dropout by mean
+        self.rank_dropout_scale = kwargs.get('rank_dropout_scale', False)
+        # Bypass mode for quantized models (Y = WX + ΔWX instead of Y = (W+ΔW)X)
+        self.bypass_mode = kwargs.get('bypass_mode', None)
+        # Unbalanced factorization for LoKr
+        self.unbalanced_factorization = kwargs.get('unbalanced_factorization', False)
+        # OFT constraint (regularization strength)
+        self.constraint = kwargs.get('constraint', 0.0)
+        # OFT rescaled (learnable rescaling)
+        self.rescaled = kwargs.get('rescaled', False)
+
         
         # for multi stage models
         self.split_multistage_loras = kwargs.get('split_multistage_loras', True)

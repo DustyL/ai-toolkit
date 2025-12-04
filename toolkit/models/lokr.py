@@ -10,7 +10,13 @@ from toolkit.network_mixins import ToolkitModuleMixin
 
 from typing import TYPE_CHECKING, Union, List
 
-from optimum.quanto import QBytesTensor, QTensor
+try:
+    from optimum.quanto import QBytesTensor, QTensor
+except ImportError:  # fallback stubs if optimum.quanto is unavailable
+    class QBytesTensor:
+        pass
+    class QTensor:
+        pass
 
 if TYPE_CHECKING:
 
@@ -76,6 +82,9 @@ def make_kron(w1, w2, scale):
 
 
 class LokrModule(ToolkitModuleMixin, nn.Module):
+    # Class-level flag to show dropout warning only once
+    _dropout_warning_shown = False
+
     def __init__(
         self,
         lora_name,
@@ -90,6 +99,13 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         decompose_both=False,
         network: 'LoRASpecialNetwork' = None,
         factor: int = -1,  # factorization factor
+        # Advanced LyCORIS parameters
+        weight_decompose: bool = False,  # DoRA-style weight decomposition
+        wd_on_out: bool = True,  # Weight decomposition direction (True = output dim)
+        use_scalar: bool = False,  # Trainable scalar for weight diff
+        rs_lora: bool = False,  # Rank-stabilized scaling (sqrt)
+        unbalanced_factorization: bool = False,  # Swap factorization dimensions
+        use_tucker: bool = False,  # Tucker decomposition for conv (alias for use_cp)
         **kwargs,
     ):
         """ if alpha == 0 or None, alpha is rank (no scaling). """
@@ -97,11 +113,23 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         torch.nn.Module.__init__(self)
         factor = int(factor)
         self.lora_name = lora_name
+        # Clamp/auto-adjust rank to a safe maximum (prevents accidental 1e10 full-rank allocations)
+        # For full-rank requests, pass a large number or -1; we'll cap to min(in_dim, out_dim).
         self.lora_dim = lora_dim
         self.cp = False
         self.use_w1 = False
         self.use_w2 = False
         self.can_merge_in = True
+
+        # Advanced LyCORIS parameters
+        self.weight_decompose = weight_decompose
+        self.wd_on_out = wd_on_out
+        self.use_scalar_param = use_scalar
+        self.rs_lora = rs_lora
+
+        # Handle use_tucker as alias for use_cp
+        if use_tucker:
+            use_cp = True
 
         self.shape = org_module.weight.shape
         if org_module.__class__.__name__ == 'Conv2d':
@@ -109,8 +137,18 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             k_size = org_module.kernel_size
             out_dim = org_module.out_channels
 
-            in_m, in_n = factorization(in_dim, factor)
-            out_l, out_k = factorization(out_dim, factor)
+            max_rank = min(in_dim, out_dim)
+            if self.lora_dim < 0 or self.lora_dim > max_rank:
+                self.lora_dim = max_rank
+            lora_dim = self.lora_dim
+
+            # Handle unbalanced factorization
+            if unbalanced_factorization:
+                in_n, in_m = factorization(in_dim, factor)
+                out_k, out_l = factorization(out_dim, factor)
+            else:
+                in_m, in_n = factorization(in_dim, factor)
+                out_l, out_k = factorization(out_dim, factor)
             # ((a, b), (c, d), *k_size)
             shape = ((out_l, out_k), (in_m, in_n), *k_size)
 
@@ -156,8 +194,18 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             in_dim = org_module.in_features
             out_dim = org_module.out_features
 
-            in_m, in_n = factorization(in_dim, factor)
-            out_l, out_k = factorization(out_dim, factor)
+            max_rank = min(in_dim, out_dim)
+            if self.lora_dim < 0 or self.lora_dim > max_rank:
+                self.lora_dim = max_rank
+            lora_dim = self.lora_dim
+
+            # Handle unbalanced factorization
+            if unbalanced_factorization:
+                in_n, in_m = factorization(in_dim, factor)
+                out_k, out_l = factorization(out_dim, factor)
+            else:
+                in_m, in_n = factorization(in_dim, factor)
+                out_l, out_k = factorization(out_dim, factor)
             # ((a, b), (c, d)), out_dim = a*c, in_dim = b*d
             shape = ((out_l, out_k), (in_m, in_n))
 
@@ -188,19 +236,55 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             self.extra_args = {}
 
         self.dropout = dropout
-        if dropout:
-            print("[WARN]LoKr haven't implemented normal dropout yet.")
+        if dropout and not LokrModule._dropout_warning_shown:
+            print("[WARN] LoKr hasn't implemented normal dropout yet. This warning will only show once.")
+            LokrModule._dropout_warning_shown = True
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
 
         if isinstance(alpha, torch.Tensor):
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
-        alpha = lora_dim if alpha is None or alpha == 0 else alpha
+        alpha = self.lora_dim if alpha is None or alpha == 0 or (isinstance(alpha, (int, float)) and alpha < 0) else alpha
         if self.use_w2 and self.use_w1:
             # use scale = 1
-            alpha = lora_dim
-        self.scale = alpha / self.lora_dim
+            alpha = self.lora_dim
+
+        # Apply rank-stabilized scaling if enabled
+        if self.rs_lora:
+            self.scale = alpha / math.sqrt(self.lora_dim)
+        else:
+            self.scale = alpha / self.lora_dim
         self.register_buffer('alpha', torch.tensor(alpha))  # treat as constant
+
+        # Initialize trainable scalar if enabled
+        if self.use_scalar_param:
+            self.scalar = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.register_buffer('scalar', torch.tensor(1.0))
+
+        # Initialize DoRA scale if weight decomposition is enabled
+        if self.weight_decompose:
+            if isinstance(org_module.weight, (QTensor, QBytesTensor)):
+                org_weight = org_module.weight.dequantize().cpu().float()
+            else:
+                org_weight = org_module.weight.cpu().clone().float()
+            self.dora_norm_dims = org_weight.dim() - 1
+            if self.wd_on_out:
+                # Compute norm along all dimensions except the output dimension (dim 0)
+                self.dora_scale = nn.Parameter(
+                    torch.norm(
+                        org_weight.reshape(org_weight.shape[0], -1),
+                        dim=1, keepdim=True,
+                    ).reshape(org_weight.shape[0], *[1] * self.dora_norm_dims)
+                ).float()
+            else:
+                # Compute norm along output dimension
+                self.dora_scale = nn.Parameter(
+                    torch.norm(
+                        org_weight.transpose(0, 1).reshape(org_weight.shape[1], -1),
+                        dim=1, keepdim=True,
+                    ).reshape(org_weight.shape[1], *[1] * self.dora_norm_dims).transpose(0, 1)
+                ).float()
 
         if self.use_w2:
             torch.nn.init.constant_(self.lokr_w2, 0)
@@ -232,21 +316,81 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         self.org_forward = self.org_module[0].forward
         self.org_module[0].forward = self.forward
 
-    def get_weight(self, orig_weight=None):
+    def get_weight(self, orig_weight=None, multiplier=None):
+        scale = self.scale
+        if self.use_scalar_param:
+            scale = scale * self.scalar
+
+        # Get reference tensor for device/dtype
+        ref_tensor = self.lokr_w1 if self.use_w1 else self.lokr_w1_a
+
+        # Preserve autograd graph: if scale is a tensor (e.g., when using trainable scalar),
+        # keep it and just move/cast; only wrap with torch.tensor when it's a plain number.
+        if torch.is_tensor(scale):
+            scale = scale.to(device=ref_tensor.device, dtype=ref_tensor.dtype, non_blocking=True)
+        else:
+            scale = torch.tensor(scale, device=ref_tensor.device, dtype=ref_tensor.dtype)
+
         weight = make_kron(
             self.lokr_w1 if self.use_w1 else self.lokr_w1_a@self.lokr_w1_b,
             (self.lokr_w2 if self.use_w2
              else make_weight_cp(self.lokr_t2, self.lokr_w2_a, self.lokr_w2_b) if self.cp
              else self.lokr_w2_a@self.lokr_w2_b),
-            torch.tensor(self.scale)
+            scale
         )
+
+        if self.training and self.dropout and self.dropout > 0:
+            weight = F.dropout(weight, p=self.dropout, training=True)
         if orig_weight is not None:
             weight = weight.reshape(orig_weight.shape)
         if self.training and self.rank_dropout:
-            drop = torch.rand(weight.size(0)) < self.rank_dropout
-            weight *= drop.view(-1, [1] *
-                                len(weight.shape[1:])).to(weight.device)
+            keep = torch.rand(weight.size(0), device=weight.device) >= self.rank_dropout
+            weight *= keep.view(-1, *[1] * len(weight.shape[1:]))
         return weight
+
+    def get_merged_weight_with_dora(self, orig_weight, multiplier=1.0, device=None, dtype=None):
+        """Get merged weight with DoRA normalization applied."""
+        if device is None:
+            device = orig_weight.device
+        if dtype is None:
+            dtype = orig_weight.dtype
+
+        # Ensure orig_weight is on correct device/dtype only if needed
+        if orig_weight.device != device or orig_weight.dtype != dtype:
+            orig_weight = orig_weight.to(device=device, dtype=dtype)
+
+        lokr_weight = self.get_weight(orig_weight)
+        if lokr_weight.device != device or lokr_weight.dtype != dtype:
+            lokr_weight = lokr_weight.to(device=device, dtype=dtype)
+
+        # Ensure multiplier is a tensor on the correct device
+        if isinstance(multiplier, (int, float)):
+            multiplier = torch.tensor(multiplier, device=device, dtype=dtype)
+        elif multiplier.device != device:
+            multiplier = multiplier.to(device=device)
+
+        # Compute the merged weight
+        merged_weight = orig_weight + lokr_weight * multiplier
+
+        if self.weight_decompose:
+            # Apply DoRA normalization
+            dora_scale = self.dora_scale.to(dtype=merged_weight.dtype, device=merged_weight.device, non_blocking=True)
+            if self.wd_on_out:
+                # Normalize along all dims except output dim
+                merged_weight_norm = torch.norm(
+                    merged_weight.reshape(merged_weight.shape[0], -1),
+                    dim=1, keepdim=True
+                ).reshape(merged_weight.shape[0], *[1] * self.dora_norm_dims)
+                merged_weight = merged_weight * (dora_scale / (merged_weight_norm + 1e-8))
+            else:
+                # Normalize along output dim
+                merged_weight_norm = torch.norm(
+                    merged_weight.transpose(0, 1).reshape(merged_weight.shape[1], -1),
+                    dim=1, keepdim=True
+                ).reshape(merged_weight.shape[1], *[1] * self.dora_norm_dims).transpose(0, 1)
+                merged_weight = merged_weight * (dora_scale / (merged_weight_norm + 1e-8))
+
+        return merged_weight
 
     @torch.no_grad()
     def merge_in(self, merge_weight=1.0):
@@ -256,29 +400,28 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         # extract weight from org_module
         org_sd = self.org_module[0].state_dict()
         # todo find a way to merge in weights when doing quantized model
-        if 'weight._data' in org_sd:
-            # quantized weight
+        weight_key = "weight._data" if 'weight._data' in org_sd else "weight"
+        if weight_key == "weight._data":
+            # quantized weight merge not supported yet
             return
-
-        weight_key = "weight"
-        if 'weight._data' in org_sd:
-            # quantized weight
-            weight_key = "weight._data"
 
         orig_dtype = org_sd[weight_key].dtype
         weight = org_sd[weight_key].float()
 
-        scale = self.scale
-        # handle trainable scaler method locon does
-        if hasattr(self, 'scalar'):
-            scale = scale * self.scalar
+        if self.weight_decompose:
+            merged_weight = self.get_merged_weight_with_dora(weight, merge_weight)
+        else:
+            scale = self.scale
+            # handle trainable scaler method locon does
+            if self.use_scalar_param:
+                scale = scale * self.scalar
 
-        lokr_weight = self.get_weight(weight)
+            lokr_weight = self.get_weight(weight)
 
-        merged_weight = (
-            weight
-            + (lokr_weight * merge_weight).to(weight.device, dtype=weight.dtype)
-        )
+            merged_weight = (
+                weight
+                + (lokr_weight * merge_weight).to(weight.device, dtype=weight.dtype)
+            )
 
         # set weight to org_module
         org_sd[weight_key] = merged_weight.to(orig_dtype)
@@ -304,28 +447,37 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             x = x.dequantize()
 
         orig_dtype = x.dtype
+        device = x.device
 
         orig_weight = self.get_orig_weight()
-        lokr_weight = self.get_weight(orig_weight).to(dtype=orig_weight.dtype)
+
+        # Move orig_weight to correct device/dtype only if needed
+        if orig_weight.device != device or orig_weight.dtype != orig_dtype:
+            orig_weight = orig_weight.to(device=device, dtype=orig_dtype, non_blocking=True)
+
         multiplier = self.network_ref().torch_multiplier
-
-        if x.dtype != orig_weight.dtype:
-            x = x.to(dtype=orig_weight.dtype)
-
         # we do not currently support split batch multipliers for lokr. Just do a mean
         multiplier = torch.mean(multiplier)
+        if multiplier.device != device:
+            multiplier = multiplier.to(device=device)
 
-        weight = (
-            orig_weight
-            + lokr_weight * multiplier
-        )
+        # Get merged weight (with DoRA if enabled)
+        if self.weight_decompose:
+            weight = self.get_merged_weight_with_dora(orig_weight, multiplier, device=device, dtype=orig_dtype)
+        else:
+            lokr_weight = self.get_weight(orig_weight)
+            # Ensure lokr_weight is on correct device/dtype
+            if lokr_weight.device != device or lokr_weight.dtype != orig_dtype:
+                lokr_weight = lokr_weight.to(device=device, dtype=orig_dtype)
+            weight = orig_weight + lokr_weight * multiplier
+
         bias = self.get_orig_bias()
         if bias is not None:
-            bias = bias.to(weight.device, dtype=weight.dtype)
+            bias = bias.to(device=device, dtype=orig_dtype)
         output = self.op(
             x,
             weight.view(self.shape),
             bias,
             **self.extra_args
         )
-        return output.to(orig_dtype)
+        return output

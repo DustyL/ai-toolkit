@@ -10,6 +10,7 @@ import torch
 from diffusers import UNet2DConditionModel, PixArtTransformer2DModel, AuraFlowTransformer2DModel, WanTransformer3DModel
 from transformers import CLIPTextModel
 from toolkit.models.lokr import LokrModule
+from toolkit.models.loha import LohaModule
 
 from .config_modules import NetworkConfig
 from .lorm import count_parameters
@@ -21,6 +22,16 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from toolkit.stable_diffusion_model import StableDiffusion
+
+# Import LyCORIS modules for advanced algorithms (BOFT, Diag-OFT)
+try:
+    from lycoris.modules.boft import ButterflyOFTModule
+    from lycoris.modules.diag_oft import DiagOFTModule
+    LYCORIS_AVAILABLE = True
+except ImportError:
+    LYCORIS_AVAILABLE = False
+    ButterflyOFTModule = None
+    DiagOFTModule = None
 
 RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
 
@@ -260,6 +271,19 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         elif self.network_type.lower() == "lokr":
             self.module_class = LokrModule
             module_class = LokrModule
+        elif self.network_type.lower() == "loha":
+            self.module_class = LohaModule
+            module_class = LohaModule
+        elif self.network_type.lower() == "boft":
+            if not LYCORIS_AVAILABLE or ButterflyOFTModule is None:
+                raise ImportError("LyCORIS is required for BOFT. Install with: pip install lycoris-lora")
+            self.module_class = ButterflyOFTModule
+            module_class = ButterflyOFTModule
+        elif self.network_type.lower() == "diag-oft":
+            if not LYCORIS_AVAILABLE or DiagOFTModule is None:
+                raise ImportError("LyCORIS is required for Diag-OFT. Install with: pip install lycoris-lora")
+            self.module_class = DiagOFTModule
+            module_class = DiagOFTModule
         self.network_config: NetworkConfig = kwargs.get("network_config", None)
 
         self.peft_format = peft_format
@@ -269,7 +293,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         # always do peft for flux only for now
         if self.is_flux or self.is_v3 or self.is_lumina2 or is_transformer:
             # don't do peft format for lokr
-            if self.network_type.lower() != "lokr":
+            if self.network_type.lower() not in ("lokr", "loha"):
                 self.peft_format = True
 
         if self.peft_format:
@@ -426,6 +450,30 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                             
                             if self.network_type.lower() == "lokr":
                                 module_kwargs["factor"] = self.network_config.lokr_factor
+                                module_kwargs["decompose_both"] = self.network_config.decompose_both
+                                module_kwargs["weight_decompose"] = self.network_config.weight_decompose
+                                module_kwargs["wd_on_out"] = self.network_config.wd_on_out
+                                module_kwargs["use_scalar"] = self.network_config.use_scalar
+                                module_kwargs["rs_lora"] = self.network_config.rs_lora
+                                module_kwargs["unbalanced_factorization"] = self.network_config.unbalanced_factorization
+                                if self.network_config.use_tucker:
+                                    module_kwargs["use_tucker"] = True
+
+                            elif self.network_type.lower() == "loha":
+                                # LoHa-specific parameters
+                                module_kwargs["use_tucker"] = self.network_config.use_tucker
+                                module_kwargs["use_scalar"] = self.network_config.use_scalar
+                                module_kwargs["weight_decompose"] = self.network_config.weight_decompose
+                                module_kwargs["wd_on_out"] = self.network_config.wd_on_out
+                                module_kwargs["rs_lora"] = self.network_config.rs_lora
+                                module_kwargs["rank_dropout_scale"] = self.network_config.rank_dropout_scale
+                                if self.network_config.bypass_mode is not None:
+                                    module_kwargs["bypass_mode"] = self.network_config.bypass_mode
+
+                            elif self.network_type.lower() in ["boft", "diag-oft"]:
+                                # OFT-specific parameters
+                                module_kwargs["constraint"] = self.network_config.constraint
+                                module_kwargs["rescaled"] = self.network_config.rescaled
                             
                             if self.is_ara:
                                 module_kwargs["is_ara"] = True
@@ -448,6 +496,11 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                             if self.network_type.lower() == "lokr":
                                 try:
                                     lora_shape_dict[lora_name] = [list(lora.lokr_w1.weight.shape), list(lora.lokr_w2.weight.shape)]
+                                except:
+                                    pass
+                            elif self.network_type.lower() == "loha":
+                                try:
+                                    lora_shape_dict[lora_name] = [list(lora.hada_w1_a.shape), list(lora.hada_w1_b.shape)]
                                 except:
                                     pass
                             else:

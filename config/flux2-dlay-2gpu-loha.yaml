@@ -1,0 +1,152 @@
+---
+# FLUX.2-dev LoHA Training - 2-GPU Contiguous Split
+# Launch: CUDA_VISIBLE_DEVICES=0,1 python run.py config/flux2-dlay-2gpu-loha.yaml
+# Or second pair: CUDA_VISIBLE_DEVICES=2,3 python run.py config/flux2-dlay-2gpu-loha.yaml
+# LoHA (Hadamard Product) - excellent for fine-grained details like faces
+
+job: extension
+config:
+  name: "dlay_flux2_loha_2gpu"
+  process:
+    - type: sd_trainer
+      training_folder: "/root/output"
+      performance_log_every: 100
+      device: cuda:0
+
+      # NETWORK CONFIGURATION - LoHA with DoRA integration
+      # LoHA = (A1 × B1) ⊙ (A2 × B2) - element-wise Hadamard product
+      network:
+        type: loha
+        linear: 128
+        linear_alpha: 64  # Half of rank for dampening
+        dropout: 0.0
+        # LoHA-specific options
+        use_tucker: false
+        use_scalar: true           # Trainable scalar
+        weight_decompose: true     # DoRA-style decomposition
+        wd_on_out: true
+        rs_lora: true              # Rank-stabilized scaling
+        rank_dropout_scale: false
+        network_kwargs:
+          rank_dropout: 0.02
+
+      # MODEL CONFIGURATION - 2-GPU Contiguous Split
+      model:
+        name_or_path: "black-forest-labs/FLUX.2-dev"
+        arch: flux2
+        quantize: false
+        quantize_te: false
+        low_vram: false
+        layer_offloading: false
+        # === 2-GPU MODEL SPLITTING ===
+        split_model_over_gpus: true
+        split_model_strategy: contiguous
+        split_model_other_module_param_count_scale: 0.3
+
+      # DATASET CONFIGURATION - Optimized captions
+      datasets:
+        - folder_path: "/root/DATASETS/DLAY/flux2"
+          caption_ext: "txt"
+          default_caption: "DLAY man"
+
+          # Focus Mask
+          mask_path: "/root/DATASETS/DLAY/mask"
+          mask_min_value: 0.0
+          invert_mask: false
+          loss_multiplier: 1.2
+
+          resolution: [512, 768, 1024]
+
+          cache_latents: true
+          cache_latents_to_disk: true
+
+          caption_dropout_rate: 0.05
+          shuffle_tokens: true
+
+      # TRAINING CONFIGURATION
+      train:
+        batch_size: 3  # Larger batch with distributed memory
+        gradient_accumulation: 1
+        steps: 6000
+
+        optimizer: prodigy
+        lr: 1.0
+        optimizer_params:
+          d_coef: 1.5
+          use_bias_correction: true
+          weight_decay: 0.01
+          safeguard_warmup: true
+          betas: "0.9,0.999"
+
+        lr_scheduler: cosine_with_warmup
+        lr_scheduler_params:
+          num_warmup_steps: 300
+          num_training_steps: 6000
+
+        dtype: bf16
+        attention_backend: flash
+        gradient_checkpointing: false  # Safe with GPU split
+
+        noise_scheduler: flowmatch
+        timestep_type: weighted
+        max_grad_norm: 1.0
+
+        min_snr_gamma: 2
+
+        ema_config:
+          use_ema: true
+          ema_decay: 0.9995
+
+        train_unet: true
+        train_text_encoder: false
+        skip_first_sample: true
+        cache_text_embeddings: true
+
+        diff_output_preservation: true
+        diff_output_preservation_multiplier: 1.0
+        diff_output_preservation_class: "man"
+
+      save:
+        dtype: bfloat16
+        save_every: 500
+        save_format: safetensors
+        max_step_saves_to_keep: 10
+
+      sample:
+        sampler: flowmatch
+        sample_every: 500
+        width: 1024
+        height: 1024
+        prompts:
+          - "DLAY man, portrait, neutral background, studio lighting"
+          - "DLAY man, corporate headshot, navy suit, professional lighting"
+          - "DLAY man, cinematic close-up, dramatic side lighting"
+          - "DLAY man, casual t-shirt, outdoor park, natural daylight"
+          - "DLAY man, full body, forest setting, dappled light"
+          - "DLAY man, holding coffee, cafe interior, warm ambient lighting"
+          - "DLAY man, beach at sunset, golden hour"
+          - "DLAY man, at desk with laptop, home office, warm lighting"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4.0
+        sample_steps: 28
+
+      logging:
+        log_every: 10
+        use_wandb: true
+        wandb_project: "flux2-dlay-b300"
+        wandb_run_name: "dlay-flux2-loha-2gpu"
+
+meta:
+  name: DLAY_flux2_loha_2gpu
+  version: '4.0'
+  description: "FLUX.2 Persona LoHA - 2-GPU contiguous split, DoRA integration"
+  trigger_words:
+    - DLAY
+  tags:
+    - portrait
+    - persona
+    - flux2
+    - loha
+    - multi-gpu

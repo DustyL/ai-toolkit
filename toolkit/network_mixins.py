@@ -22,9 +22,10 @@ if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork, LoRAModule
     from toolkit.stable_diffusion_model import StableDiffusion
     from toolkit.models.DoRA import DoRAModule
+    from toolkit.models.loha import LohaModule
 
 Network = Union['LycorisSpecialNetwork', 'LoRASpecialNetwork']
-Module = Union['LoConSpecialModule', 'LoRAModule', 'DoRAModule']
+Module = Union['LoConSpecialModule', 'LoRAModule', 'DoRAModule', 'LohaModule']
 
 LINEAR_MODULES = [
     'Linear',
@@ -291,6 +292,9 @@ class ToolkitModuleMixin:
         #     return self.dora_forward(x, *args, **kwargs)
         
         if self.__class__.__name__ == "LokrModule":
+            return self._call_forward(x)
+
+        if self.__class__.__name__ == "LohaModule":
             return self._call_forward(x)
 
         org_forwarded = self.org_forward(x, *args, **kwargs)
