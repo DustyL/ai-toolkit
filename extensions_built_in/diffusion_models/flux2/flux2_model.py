@@ -134,6 +134,9 @@ class Flux2Model(BaseModel):
             self.print_and_status_update("Applying GPU model splitting")
             add_model_gpu_splitter_to_flux2(
                 transformer,
+                gpu_split_double=self.model_config.gpu_split_double,
+                gpu_split_single=self.model_config.gpu_split_single,
+                use_stream_transfers=self.model_config.use_stream_transfers,
                 other_module_param_count_scale=self.model_config.split_model_other_module_param_count_scale
             )
 

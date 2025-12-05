@@ -759,6 +759,12 @@ class ToolkitNetworkMixin:
             dtype = first_module.lokr_w1_a.dtype
             if hasattr(first_module.lokr_w1_a, '_memory_management_device'):
                 device = first_module.lokr_w1_a._memory_management_device
+        elif hasattr(first_module, 'hada_w1_a'):
+            # LoHA module uses Hadamard product decomposition (hada_w1_a, hada_w1_b, hada_w2_a, hada_w2_b)
+            device = first_module.hada_w1_a.device
+            dtype = first_module.hada_w1_a.dtype
+            if hasattr(first_module.hada_w1_a, '_memory_management_device'):
+                device = first_module.hada_w1_a._memory_management_device
         else:
             raise ValueError("Unknown module type")
         with torch.no_grad():

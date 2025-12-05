@@ -199,10 +199,13 @@ class NetworkConfig:
         
         self.lokr_full_rank = kwargs.get('lokr_full_rank', False)
         if self.lokr_full_rank and self.type.lower() == 'lokr':
-            self.linear = 9999999999
-            self.linear_alpha = 9999999999
-            self.conv = 9999999999
-            self.conv_alpha = 9999999999
+            # Use sentinel values and let LokrModule clamp to the full viable rank
+            # (min(in_dim, out_dim)). Alpha is set to 0 so the module will
+            # replace it with the resolved rank, avoiding huge scales.
+            self.linear = -1
+            self.linear_alpha = 0
+            self.conv = -1
+            self.conv_alpha = 0
         # -1 automatically finds the largest factor
         self.lokr_factor = kwargs.get('lokr_factor', -1)
         # Advanced LyCORIS parameters
@@ -654,7 +657,29 @@ class ModelConfig:
         self.split_model_over_gpus = kwargs.get("split_model_over_gpus", False)
         # Note: validation for split_model_over_gpus moved to after arch processing (see below)
         self.split_model_other_module_param_count_scale = kwargs.get("split_model_other_module_param_count_scale", 0.3)
-        
+
+        # Explicit GPU split configuration for deterministic block distribution
+        # gpu_split_double: list of ints specifying double blocks per GPU, e.g., [4, 4] for 2 GPUs
+        # gpu_split_single: list of ints specifying single blocks per GPU, e.g., [24, 24] for 2 GPUs
+        self.gpu_split_double: list = kwargs.get("gpu_split_double", None)
+        self.gpu_split_single: list = kwargs.get("gpu_split_single", None)
+        # use_stream_transfers: enable CUDA stream-based transfers for overlapped compute/transfer
+        # This is an experimental feature that may improve throughput on multi-GPU setups
+        self.use_stream_transfers: bool = kwargs.get("use_stream_transfers", False)
+
+        # Validate gpu_split options
+        if self.gpu_split_double is not None:
+            if not isinstance(self.gpu_split_double, list) or not all(isinstance(x, int) for x in self.gpu_split_double):
+                raise ValueError(f"gpu_split_double must be a list of integers, got {type(self.gpu_split_double)}")
+            if len(self.gpu_split_double) < 1:
+                raise ValueError(f"gpu_split_double must have at least 1 element")
+
+        if self.gpu_split_single is not None:
+            if not isinstance(self.gpu_split_single, list) or not all(isinstance(x, int) for x in self.gpu_split_single):
+                raise ValueError(f"gpu_split_single must be a list of integers, got {type(self.gpu_split_single)}")
+            if len(self.gpu_split_single) < 1:
+                raise ValueError(f"gpu_split_single must have at least 1 element")
+
         self.te_name_or_path = kwargs.get("te_name_or_path", None)
         
         self.arch: ModelArch = kwargs.get("arch", None)
@@ -758,6 +783,24 @@ class ModelConfig:
         # Validate split_model_over_gpus after arch processing (is_flux/is_flux2 are now set)
         if self.split_model_over_gpus and not (self.is_flux or self.is_flux2):
             raise ValueError("split_model_over_gpus is only supported with flux and flux2 models currently")
+
+        # Validate gpu_split options for FLUX.2 (8 double blocks, 48 single blocks)
+        if self.is_flux2:
+            if self.gpu_split_double is not None and sum(self.gpu_split_double) != 8:
+                raise ValueError(f"gpu_split_double must sum to 8 for FLUX.2, got {sum(self.gpu_split_double)}")
+            if self.gpu_split_single is not None and sum(self.gpu_split_single) != 48:
+                raise ValueError(f"gpu_split_single must sum to 48 for FLUX.2, got {sum(self.gpu_split_single)}")
+
+        # Validate gpu_split options for FLUX.1 (19 double blocks, 38 single blocks)
+        if self.is_flux:
+            if self.gpu_split_double is not None and sum(self.gpu_split_double) != 19:
+                raise ValueError(f"gpu_split_double must sum to 19 for FLUX.1, got {sum(self.gpu_split_double)}")
+            if self.gpu_split_single is not None and sum(self.gpu_split_single) != 38:
+                raise ValueError(f"gpu_split_single must sum to 38 for FLUX.1, got {sum(self.gpu_split_single)}")
+
+        # Warn about layer_offloading conflict with split_model_over_gpus
+        if self.split_model_over_gpus and self.layer_offloading:
+            print("Warning: layer_offloading and split_model_over_gpus conflict. layer_offloading will be disabled.")
 
 
 class EMAConfig:
