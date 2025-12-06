@@ -7,6 +7,9 @@ def get_optimizer(
         learning_rate=1e-6,
         optimizer_params=None
 ):
+    # Defensive import to avoid rare UnboundLocalError reports when torch is only imported at module scope
+    import torch as _torch
+
     if optimizer_params is None:
         optimizer_params = {}
     lower_type = optimizer_type.lower()
@@ -74,9 +77,9 @@ def get_optimizer(
         else:
             raise ValueError(f'Unknown optimizer type {optimizer_type}')
     elif lower_type == 'adam':
-        optimizer = torch.optim.Adam(params, lr=float(learning_rate), eps=1e-6, **optimizer_params)
+        optimizer = _torch.optim.Adam(params, lr=float(learning_rate), eps=1e-6, **optimizer_params)
     elif lower_type == 'adamw':
-        optimizer = torch.optim.AdamW(params, lr=float(learning_rate), eps=1e-6, **optimizer_params)
+        optimizer = _torch.optim.AdamW(params, lr=float(learning_rate), eps=1e-6, **optimizer_params)
     elif lower_type == 'lion':
         try:
             from lion_pytorch import Lion
@@ -84,7 +87,7 @@ def get_optimizer(
         except ImportError:
             raise ImportError("Please install lion_pytorch to use Lion optimizer -> pip install lion-pytorch")
     elif lower_type == 'adagrad':
-        optimizer = torch.optim.Adagrad(params, lr=float(learning_rate), **optimizer_params)
+        optimizer = _torch.optim.Adagrad(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'adafactor':
         from toolkit.optimizers.adafactor import Adafactor
         if 'relative_step' not in optimizer_params:

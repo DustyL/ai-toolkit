@@ -1825,10 +1825,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.network.multiplier = 1.0
                 
                 if self.network_config.layer_offloading:
+                    offload_percent = getattr(self.network_config, 'layer_offloading_percent', 1.0)
                     MemoryManager.attach(
                         self.network,
-                        self.device_torch
+                        self.device_torch,
+                        offload_percent=offload_percent
                     )
+                    MemoryManager.log_status(self.network, "network")
 
             if self.embed_config is not None:
                 # we are doing embedding training as well
@@ -2226,6 +2229,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print("\n==== Profile Results ====")
                 print(self.torch_profiler.key_averages().table(sort_by="cpu_time_total", row_limit=1000))
             self.timer.stop('train_loop')
+            # If we OOM-ed or no loss was produced, skip the rest of this step safely
+            if did_oom or loss_dict is None:
+                continue
             if not did_first_flush:
                 flush()
                 did_first_flush = True
@@ -2387,6 +2393,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     repo_id=self.save_config.hf_repo_id,
                     private=self.save_config.hf_private
                 )
+
+        # Clean up memory management before deleting models
+        if self.model_config.layer_offloading:
+            if hasattr(self.sd, 'unet') and MemoryManager.is_attached(self.sd.unet):
+                MemoryManager.detach(self.sd.unet)
+            if hasattr(self.sd, 'transformer') and MemoryManager.is_attached(self.sd.transformer):
+                MemoryManager.detach(self.sd.transformer)
+            if hasattr(self.sd, 'text_encoder') and MemoryManager.is_attached(self.sd.text_encoder):
+                MemoryManager.detach(self.sd.text_encoder)
+        if self.network_config.layer_offloading:
+            if self.network is not None and MemoryManager.is_attached(self.network):
+                MemoryManager.detach(self.network)
+
         del (
             self.sd,
             unet,

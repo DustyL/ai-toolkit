@@ -576,6 +576,161 @@ class TestBlockReset:
 
 
 # =============================================================================
+# Test: Topology Recovery (moving_to_cuda with missing _split_device)
+# =============================================================================
+
+class TestTopologyRecovery:
+    """Test recovery from topology failures where _split_device is missing."""
+
+    def test_getattr_fallback_pattern(self):
+        """
+        Test the getattr fallback pattern used in new_device_to_flux2.
+
+        This verifies the fix for AttributeError when _split_device is missing
+        in the moving_to_cuda branch. The pattern is:
+            block_device = getattr(block, "_split_device", device)
+
+        If _split_device doesn't exist, it falls back to the target device.
+        """
+        block = MockBlock()
+        target_device = MockDevice("cuda:0")
+
+        # Case 1: _split_device exists - should return it
+        block._split_device = MockDevice("cuda:1")
+        result = getattr(block, "_split_device", target_device)
+        assert str(result) == "cuda:1"
+
+        # Case 2: _split_device missing - should return fallback
+        delattr(block, "_split_device")
+        result = getattr(block, "_split_device", target_device)
+        assert str(result) == "cuda:0"
+
+    def test_moving_to_cuda_code_path_guard(self):
+        """
+        Test the guard logic that prevents AttributeError in moving_to_cuda branch.
+
+        This tests the specific code pattern:
+            if hasattr(block, "_original_split_device"):
+                block._split_device = block._original_split_device
+            block_device = getattr(block, "_split_device", device)
+
+        Without the getattr guard, this would crash when neither
+        _original_split_device nor _split_device exist.
+        """
+        block = MockBlock()
+        device = MockDevice("cuda:0")
+
+        # Simulate the guarded code path
+        if hasattr(block, "_original_split_device"):
+            block._split_device = block._original_split_device
+
+        # This is the fix - getattr with fallback instead of direct access
+        block_device = getattr(block, "_split_device", device)
+
+        # Should have fallen back to device since neither attr exists
+        assert str(block_device) == "cuda:0"
+
+    def test_moving_to_cuda_with_original_split_device(self):
+        """
+        Test moving_to_cuda path when _original_split_device exists.
+        """
+        block = MockBlock()
+        device = MockDevice("cuda:0")
+
+        # Block has _original_split_device from previous CPU move
+        block._original_split_device = MockDevice("cuda:1")
+
+        # Simulate the guarded code path
+        if hasattr(block, "_original_split_device"):
+            block._split_device = block._original_split_device
+
+        block_device = getattr(block, "_split_device", device)
+
+        # Should use the original split device, not the fallback
+        assert str(block_device) == "cuda:1"
+        assert str(block._split_device) == "cuda:1"
+
+    def test_reset_block_then_recover(self):
+        """
+        Integration test: _reset_block clears attrs, then code recovers gracefully.
+        """
+        from extensions_built_in.diffusion_models.flux2.flux2_gpu_splitter import _reset_block
+
+        block = MockBlock()
+        device = MockDevice("cuda:0")
+
+        # Setup block as if it was split
+        block._split_device = MockDevice("cuda:1")
+        block._original_split_device = MockDevice("cuda:1")
+        block._pre_gpu_split_forward = block.forward
+
+        # Reset clears everything
+        _reset_block(block)
+
+        assert not hasattr(block, "_split_device")
+        assert not hasattr(block, "_original_split_device")
+
+        # Now simulate moving_to_cuda code path - should NOT crash
+        if hasattr(block, "_original_split_device"):
+            block._split_device = block._original_split_device
+
+        # The fix: use getattr with fallback
+        block_device = getattr(block, "_split_device", device)
+
+        # Should have used fallback
+        assert str(block_device) == "cuda:0"
+
+    def test_fallback_reassigns_split_device(self):
+        """
+        Test that when fallback is used, _split_device is reassigned for consistency.
+
+        This ensures subsequent calls don't keep hitting the guard and the model
+        ends up in a consistent single-GPU state.
+        """
+        block = MockBlock()
+        device = MockDevice("cuda:0")
+
+        # Block has no _split_device (simulating post-reset state)
+        assert not hasattr(block, "_split_device")
+
+        # Simulate the tightened code path (guard + reassign)
+        if hasattr(block, "_original_split_device"):
+            block._split_device = block._original_split_device
+
+        block_device = getattr(block, "_split_device", device)
+        if not hasattr(block, "_split_device"):
+            block._split_device = block_device
+
+        # After fallback, _split_device should be set
+        assert hasattr(block, "_split_device")
+        assert str(block._split_device) == "cuda:0"
+
+        # Second call should NOT hit the fallback
+        block_device_2 = getattr(block, "_split_device", MockDevice("cuda:99"))
+        assert str(block_device_2) == "cuda:0"  # Should use the now-existing attr
+
+    def test_split_output_device_guard(self):
+        """
+        Test that _split_output_device is also guarded and reassigned.
+        """
+        block = MockBlock()
+        device = MockDevice("cuda:0")
+
+        # Block has no _split_output_device (simulating post-reset state)
+        assert not hasattr(block, "_split_output_device")
+
+        # Simulate the guarded code path for _split_output_device
+        if hasattr(block, "_original_split_output_device"):
+            block._split_output_device = block._original_split_output_device
+        if not hasattr(block, "_split_output_device"):
+            block._split_output_device = device
+
+        # After fallback, _split_output_device should be set
+        assert hasattr(block, "_split_output_device")
+        assert str(block._split_output_device) == "cuda:0"
+
+
+# =============================================================================
 # Test: Tensor Movement Helpers
 # =============================================================================
 

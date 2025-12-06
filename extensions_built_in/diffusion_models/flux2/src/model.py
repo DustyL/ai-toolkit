@@ -4,6 +4,9 @@ from torch import Tensor, nn
 import torch.utils.checkpoint as ckpt
 import math
 from dataclasses import dataclass, field
+from typing import Optional
+
+from .attention_backends import AttentionContext, get_attention_function
 
 
 @dataclass
@@ -298,7 +301,9 @@ class SingleStreamBlock(nn.Module):
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
 
-        attn = attention(q, k, v, pe)
+        # Pass attention context if available (set by initialize_attention_for_flux2)
+        ctx = getattr(self, '_attention_context', None)
+        attn = attention(q, k, v, pe, context=ctx)
 
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
@@ -394,7 +399,9 @@ class DoubleStreamBlock(nn.Module):
         v = torch.cat((txt_v, img_v), dim=2)
 
         pe = torch.cat((pe_ctx, pe), dim=2)
-        attn = attention(q, k, v, pe)
+        # Pass attention context if available (set by initialize_attention_for_flux2)
+        ctx = getattr(self, '_attention_context', None)
+        attn = attention(q, k, v, pe, context=ctx)
         txt_attn, img_attn = attn[:, : txt_q.shape[2]], attn[:, txt_q.shape[2] :]
 
         # calculate the img blocks
@@ -491,12 +498,37 @@ class QKNorm(torch.nn.Module):
         return q.to(v), k.to(v)
 
 
-def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
+def attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    pe: Tensor,
+    context: Optional[AttentionContext] = None
+) -> Tensor:
+    """
+    Compute attention for Flux.2 transformer blocks.
+
+    INVARIANT: RoPE is applied BEFORE any layout transformation.
+    This is critical for correctness - RoPE must operate on the original
+    [B, H, L, D] layout before Flash/CuTE do their transpose.
+
+    Args:
+        q, k, v: Query, key, value tensors in [B, H, L, D] layout
+        pe: Positional embeddings for RoPE
+        context: Optional AttentionContext for backend selection.
+                 If None, falls back to SDPA.
+    """
+    # RoPE invariant: ALWAYS apply before any layout transformation
     q, k = apply_rope(q, k, pe)
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    x = rearrange(x, "B H L D -> B L (H D)")
+    if context is not None:
+        # Use context's attention method (handles layout, guards, fallback)
+        x = context.attention(q, k, v)
+    else:
+        # Fallback to SDPA when no context (backward compatibility)
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
+    x = rearrange(x, "B H L D -> B L (H D)")
     return x
 
 

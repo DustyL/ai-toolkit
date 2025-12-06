@@ -195,6 +195,7 @@ class ZImageModel(BaseModel):
                     transformer.cap_pad_token,
                 ]
             )
+            MemoryManager.log_status(transformer, "transformer")
 
         if self.model_config.low_vram:
             self.print_and_status_update("Moving transformer to CPU")
@@ -219,6 +220,7 @@ class ZImageModel(BaseModel):
                 self.device_torch,
                 offload_percent=self.model_config.layer_offloading_text_encoder_percent,
             )
+            MemoryManager.log_status(text_encoder, "text_encoder")
 
         text_encoder.to(self.device_torch, dtype=dtype)
         flush()

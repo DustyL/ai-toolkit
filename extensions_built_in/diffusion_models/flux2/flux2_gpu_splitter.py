@@ -477,7 +477,9 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
             # Restoring a valid split topology from CPU
             if hasattr(block, "_original_split_device"):
                 block._split_device = block._original_split_device
-            block_device = block._split_device
+            # Guard against missing _split_device and ensure consistent state
+            block_device = getattr(block, "_split_device", device)
+            block._split_device = block_device
         elif has_device:
             # Split metadata was cleared (topology failure) or never had a split:
             # restore _original_split_device if available, else use target device
@@ -503,7 +505,9 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
             # Restoring a valid split topology from CPU
             if hasattr(block, "_original_split_device"):
                 block._split_device = block._original_split_device
-            block_device = block._split_device
+            # Guard against missing _split_device and ensure consistent state
+            block_device = getattr(block, "_split_device", device)
+            block._split_device = block_device
         elif has_device:
             # Split metadata was cleared or never had a split:
             # restore _original_split_device if available, else use target device
@@ -531,7 +535,9 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
             # Restoring valid split topology: use original split output device if available
             if hasattr(last_block, "_original_split_output_device"):
                 last_block._split_output_device = last_block._original_split_output_device
-            # If no original, leave _split_output_device as-is (should still exist)
+            # Guard against missing _split_output_device and ensure consistent state
+            output_dev = getattr(last_block, "_split_output_device", device)
+            last_block._split_output_device = output_dev
         else:
             # Split metadata was cleared or never had a split: set to target device
             last_block._split_output_device = device

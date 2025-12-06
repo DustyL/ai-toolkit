@@ -2,6 +2,7 @@
 # Adapted for ai-toolkit with ToolkitModuleMixin integration
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -258,6 +259,20 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
             r_factor = math.sqrt(r_factor)
 
         self.scale = alpha / r_factor
+        # Warning: rs_lora with high alpha can cause very large scales.
+        # Without rs_lora: scale = alpha / rank (e.g., 64/64 = 1.0)
+        # With rs_lora: scale = alpha / sqrt(rank) (e.g., 64/8 = 8.0 for rank=64)
+        # If using rs_lora, consider reducing alpha to ~sqrt(rank) to maintain similar scaling.
+        if self.rs_lora and alpha > 2 * math.sqrt(lora_dim):
+            warnings.warn(
+                f"LoHA '{lora_name}': rs_lora=True with alpha={alpha} and rank={lora_dim} "
+                f"produces scale={self.scale:.2f}. This may cause training instability. "
+                f"Consider alpha <= {2 * math.sqrt(lora_dim):.1f} (2*sqrt(rank)) for stability.",
+                UserWarning
+            )
+        # Note: alpha buffer is stored for state_dict compatibility with LyCORIS format.
+        # The actual scaling uses self.scale during forward pass.
+        # Buffer value = alpha * (lora_dim / r_factor) to match LyCORIS conventions.
         self.register_buffer("alpha", torch.tensor(alpha * (lora_dim / r_factor)))
 
         # Trainable scalar (initialized to 1.0 for immediate effect, matching LokrModule)
@@ -322,7 +337,8 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
             drop = (torch.rand(weight.size(0), device=weight.device) > self.rank_dropout).to(weight.dtype)
             drop = drop.view(-1, *[1] * len(weight.shape[1:]))
             if self.rank_dropout_scale:
-                drop /= drop.mean()
+                # Add epsilon guard to prevent divide-by-zero if all ranks drop
+                drop /= drop.mean().clamp(min=1e-6)
             weight = weight * drop
 
         return weight
@@ -337,12 +353,11 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
         if orig_weight.device != device or orig_weight.dtype != dtype:
             orig_weight = orig_weight.to(device=device, dtype=dtype)
 
-        loha_weight = self.get_weight(self.shape)
+        # Apply scalar before dtype cast to keep intermediate math in fp32,
+        # then cast once at the boundary (matches _call_forward pattern)
+        loha_weight = self.get_weight(self.shape) * self.scalar
         if loha_weight.device != device or loha_weight.dtype != dtype:
             loha_weight = loha_weight.to(device=device, dtype=dtype)
-
-        # Apply scalar
-        loha_weight = loha_weight * self.scalar
 
         if isinstance(multiplier, (int, float)):
             multiplier = torch.tensor(multiplier, device=device, dtype=dtype)
@@ -353,18 +368,22 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
 
         if self.weight_decompose:
             dora_scale = self.dora_scale.to(dtype=merged_weight.dtype, device=merged_weight.device)
+            # Use practical epsilon for numerical stability in DoRA normalization.
+            # torch.finfo(dtype).eps can be too small (~6e-8 for fp16), causing issues
+            # with very small norms. Use max(finfo.eps, 1e-6) for robustness.
+            eps = max(torch.finfo(merged_weight.dtype).eps, 1e-6)
             if self.wd_on_out:
                 merged_weight_norm = torch.norm(
                     merged_weight.reshape(merged_weight.shape[0], -1),
                     dim=1, keepdim=True
                 ).reshape(merged_weight.shape[0], *[1] * self.dora_norm_dims)
-                merged_weight = merged_weight * (dora_scale / (merged_weight_norm + 1e-8))
+                merged_weight = merged_weight * (dora_scale / (merged_weight_norm + eps))
             else:
                 merged_weight_norm = torch.norm(
                     merged_weight.transpose(0, 1).reshape(merged_weight.shape[1], -1),
                     dim=1, keepdim=True
                 ).reshape(merged_weight.shape[1], *[1] * self.dora_norm_dims).transpose(0, 1)
-                merged_weight = merged_weight * (dora_scale / (merged_weight_norm + 1e-8))
+                merged_weight = merged_weight * (dora_scale / (merged_weight_norm + eps))
 
         return merged_weight
 
@@ -422,7 +441,12 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
             orig_weight = orig_weight.to(device=device, dtype=orig_dtype)
 
         multiplier = self.network_ref().torch_multiplier
-        multiplier = torch.mean(multiplier)
+        # Note: Per-sample multipliers are not supported in weight-merging mode.
+        # When multiplier is a tensor with multiple values (e.g., for slider training),
+        # we average them since the weight is shared across the batch.
+        # Use bypass_mode=True for true per-sample multiplier support.
+        if multiplier.numel() > 1:
+            multiplier = torch.mean(multiplier)
         if multiplier.device != device:
             multiplier = multiplier.to(device=device)
 
@@ -446,11 +470,60 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
         )
         return output
 
+    def _bypass_forward_diff(self, x, scale=1.0):
+        """Compute just the LoHA delta output for bypass mode.
+
+        Args:
+            x: Input tensor of shape [batch, ...]
+            scale: Either a scalar or a tensor of shape [batch] for per-sample scaling
+
+        Note: This method applies the same dropout/rank_dropout as the standard path
+        via get_weight(), ensuring consistency between bypass and weight-merge modes.
+        Bias is handled by org_forward() in _bypass_forward(), not here.
+        """
+        device = x.device
+        dtype = x.dtype
+
+        # get_weight() already applies rank_dropout and element dropout during training
+        diff_weight = self.get_weight(self.shape) * self.scalar
+        if diff_weight.device != device or diff_weight.dtype != dtype:
+            diff_weight = diff_weight.to(device=device, dtype=dtype)
+
+        # Compute LoHA output (no bias - that's in org_forward)
+        diff_output = self.op(x, diff_weight.view(self.shape), None, **self.extra_args)
+
+        # Apply per-sample scaling if scale is a tensor
+        if isinstance(scale, torch.Tensor) and scale.numel() > 1:
+            # Reshape scale for broadcasting: [batch] -> [batch, 1, 1, ...]
+            scale = scale.view(-1, *([1] * (diff_output.dim() - 1)))
+            if scale.device != device:
+                scale = scale.to(device=device, dtype=dtype)
+
+        return diff_output * scale
+
+    def _bypass_forward(self, x, scale=1.0):
+        """Bypass forward: Y = W_base(X) + scale * ΔW(X) instead of Y = (W_base + ΔW)(X).
+
+        This mode supports per-sample multipliers since scaling is applied to output,
+        not to weights. Useful for:
+        - Quantized models where we can't easily merge weights
+        - Slider training with per-sample multipliers
+        """
+        return self.org_forward(x) + self._bypass_forward_diff(x, scale=scale)
+
     def forward(self, x, *args, **kwargs):
         """Forward pass with LoHa adaptation."""
         # Module dropout during training
         if self.module_dropout and self.training:
             if torch.rand(1).item() < self.module_dropout:
                 return self.org_forward(x, *args, **kwargs)
+
+        # Bypass mode: compute base and delta separately
+        # This mode supports per-sample multipliers (no averaging needed)
+        if self.bypass_mode:
+            multiplier = self.network_ref().torch_multiplier
+            if multiplier.device != x.device:
+                multiplier = multiplier.to(device=x.device)
+            return self._bypass_forward(x, scale=multiplier)
 
         return self._call_forward(x)

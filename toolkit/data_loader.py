@@ -546,6 +546,56 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             else:
                 print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
 
+        # Mark pre-existing text embedding cache files so we can load them even when
+        # cache_text_embeddings is False. This avoids re-encoding on every run.
+        # Run after flips so duplicated items inherit the cached flag.
+        for file_item in self.file_list:
+            try:
+                # ensure arch is set for hash consistency (e.g., "flux2")
+                if self.sd and hasattr(self.sd, "model_config") and hasattr(self.sd.model_config, "arch"):
+                    file_item.text_embedding_space_version = self.sd.model_config.arch
+                te_path = file_item.get_text_embedding_path(recalculate=True)
+                if os.path.exists(te_path):
+                    file_item.is_text_embedding_cached = True
+                    file_item._text_embedding_path = te_path
+                else:
+                    # Fallback: accept any cached safetensor with the same basename prefix
+                    base = os.path.splitext(os.path.basename(file_item.path))[0]
+                    fallback_dir = os.path.join(os.path.dirname(file_item.path), "_t_e_cache")
+                    if os.path.isdir(fallback_dir):
+                        import glob
+                        candidates = glob.glob(os.path.join(fallback_dir, f"{base}_*.safetensors"))
+                        if len(candidates) > 0:
+                            # pick the most recent
+                            candidates.sort(key=os.path.getmtime, reverse=True)
+                            file_item._text_embedding_path = candidates[0]
+                            file_item.is_text_embedding_cached = True
+                            print_acc(f"[TE CACHE] Fallback matched {base} -> {candidates[0]}")
+            except Exception:
+                # if anything goes wrong, continue without marking
+                pass
+
+        # Report cache coverage for visibility
+        if len(self.file_list) > 0:
+            cached = sum(1 for x in self.file_list if x.is_text_embedding_cached)
+            total = len(self.file_list)
+            arch = getattr(self.sd.model_config, "arch", "unknown") if self.sd else "unknown"
+            if cached > 0:
+                print_acc(f"[TE CACHE] Found cached embeddings for {cached}/{total} files (arch={arch}).")
+            if not self.dataset_config.cache_text_embeddings and cached < total:
+                missing = total - cached
+                print_acc(f"[TE CACHE] Missing cache for {missing} files; cache_text_embeddings is False, so those will be encoded on the fly.")
+                # Optional: force caching missing entries when env var is set
+                if os.environ.get("AITK_FORCE_CACHE_MISSING") == "1":
+                    print_acc(f"[TE CACHE] AITK_FORCE_CACHE_MISSING=1 -> caching missing text embeddings now.")
+                    # Temporarily enable caching flag for this dataset and run cache step
+                    self.is_caching_text_embeddings = True
+                    self.cache_text_embeddings()
+                    # Recompute coverage after caching
+                    cached = sum(1 for x in self.file_list if x.is_text_embedding_cached)
+                    missing = total - cached
+                    print_acc(f"[TE CACHE] Post-force-cache coverage: {cached}/{total} (missing {missing}).")
+
         self.setup_epoch()
 
     def setup_epoch(self):
