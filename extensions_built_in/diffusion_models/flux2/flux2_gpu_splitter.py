@@ -149,7 +149,8 @@ def split_gpu_double_block_forward(
         _synchronize_device(device)
         _log_debug(f"Synced double block on {device}")
 
-    return self._pre_gpu_split_forward(img, txt, pe, pe_ctx, mod_img, mod_txt)
+    with torch.cuda.device(device):
+        return self._pre_gpu_split_forward(img, txt, pe, pe_ctx, mod_img, mod_txt)
 
 
 def split_gpu_single_block_forward(
@@ -182,7 +183,8 @@ def split_gpu_single_block_forward(
         _synchronize_device(device)
         _log_debug(f"Synced single block on {device}")
 
-    x_out = self._pre_gpu_split_forward(x, pe, mod)
+    with torch.cuda.device(device):
+        x_out = self._pre_gpu_split_forward(x, pe, mod)
 
     # Route output to specified device (used for last block to return to output device)
     if hasattr(self, "_split_output_device"):
@@ -246,9 +248,10 @@ def split_gpu_double_block_forward_streamed(
     mgr.wait_for_transfer(device)
 
     # Run the actual forward
-    img_out, txt_out = self._pre_gpu_split_forward(
-        img, txt, pe, pe_ctx, mod_img, mod_txt
-    )
+    with torch.cuda.device(device):
+        img_out, txt_out = self._pre_gpu_split_forward(
+            img, txt, pe, pe_ctx, mod_img, mod_txt
+        )
 
     # Mark compute complete (allows next device's transfer to start)
     mgr.mark_compute_complete(device)
@@ -289,7 +292,8 @@ def split_gpu_single_block_forward_streamed(
     mgr.wait_for_transfer(device)
 
     # Compute
-    x_out = self._pre_gpu_split_forward(x, pe, mod)
+    with torch.cuda.device(device):
+        x_out = self._pre_gpu_split_forward(x, pe, mod)
 
     # Mark compute complete
     mgr.mark_compute_complete(device)

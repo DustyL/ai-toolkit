@@ -518,6 +518,10 @@ def attention(
         context: Optional AttentionContext for backend selection.
                  If None, falls back to SDPA.
     """
+    # Ensure PE is on the correct device (belt-and-braces for multi-GPU split)
+    if pe.device != q.device:
+        pe = pe.to(q.device, non_blocking=True)
+
     # RoPE invariant: ALWAYS apply before any layout transformation
     q, k = apply_rope(q, k, pe)
 
