@@ -20,6 +20,11 @@ from .manager_modules import (
     ModuleOffloadState,
     _is_quantized_tensor,
 )
+from .loha_layer_manager import (
+    LoHALayerMemoryManager,
+    _is_loha_module,
+    _is_lokr_module,
+)
 from toolkit.print import print_acc
 
 LINEAR_MODULES = [
@@ -164,12 +169,24 @@ class MemoryManager:
 
                 is_linear = child_module.__class__.__name__ in LINEAR_MODULES
                 is_conv = child_module.__class__.__name__ in CONV_MODULES
+                is_loha = _is_loha_module(child_module)
+                is_lokr = _is_lokr_module(child_module)
                 is_unmanaged = (
                     child_module.__class__.__name__ in UNMANAGED_MODULES or
                     any(inc in child_module.__class__.__name__ for inc in UNMANAGED_MODULES_INCLUDES)
                 )
 
-                if is_linear or is_conv:
+                if is_loha:
+                    # LoHA module - uses nn.Parameter, not nn.Linear
+                    eligible_modules.append((child_module, 'loha'))
+                    modules_processed.add(id(child_module))
+                elif is_lokr:
+                    # LoKr module - currently logged but not fully supported
+                    if debug_mm:
+                        print_acc(f"[MM] Found LoKr module {child_name} - LoKr offloading not yet implemented, skipping")
+                    module._memory_manager.unmanaged_modules.append(child_module)
+                    modules_processed.add(id(child_module))
+                elif is_linear or is_conv:
                     # Check for quantized weights with requires_grad (unsupported)
                     if hasattr(child_module, 'weight') and child_module.weight is not None:
                         weight = child_module.weight
@@ -219,8 +236,15 @@ class MemoryManager:
             if idx in layers_to_offload:
                 if module_type == 'linear':
                     LinearLayerMemoryManager.attach(child_module, module._memory_manager)
-                else:
+                elif module_type == 'conv':
                     ConvLayerMemoryManager.attach(child_module, module._memory_manager)
+                elif module_type == 'loha':
+                    LoHALayerMemoryManager.attach(child_module, module._memory_manager)
+                else:
+                    # Unknown type, skip
+                    module._memory_manager.unmanaged_modules.append(child_module)
+                    skipped_count += 1
+                    continue
 
                 module._memory_manager._managed_layers.append(child_module)
                 managed_count += 1
