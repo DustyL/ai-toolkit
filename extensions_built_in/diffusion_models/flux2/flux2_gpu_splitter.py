@@ -9,21 +9,27 @@ FLUX.2 Architecture:
 - 48 single blocks (SingleStreamBlock): Process concatenated img+txt stream
 - Total: ~12B transformer parameters
 
-Improvements over original implementation:
-- Deterministic block splits for 2 and 4 GPUs (even distribution)
+Features:
+- Deterministic block splits for 2, 4, and 8 GPUs (even distribution)
 - User-configurable splits via gpu_split_double/gpu_split_single
-- Proper CUDA synchronization for device transfers
+- Configurable per-block synchronization (default: off for performance)
+- Configurable output device routing
 - Optional CUDA stream-based transfers for overlapped compute/transfer
-- Better logging and distribution tracking
+- Proper validation of split device state across .to() operations
+- Debug logging support (set FLUX_SPLITTER_DEBUG=1 to enable)
 """
 
+import os
 from functools import partial
 from typing import Optional, List, TYPE_CHECKING
 import torch
 from torch import Tensor
+import logging
 
 if TYPE_CHECKING:
     from .src.model import Flux2
+
+logger = logging.getLogger(__name__)
 
 # Import stream manager (optional feature)
 try:
@@ -50,6 +56,31 @@ DEFAULT_SPLITS = {
         "single": [6, 6, 6, 6, 6, 6, 6, 6],  # 6 blocks per GPU
     },
 }
+
+
+# Global debug flag (can be set via set_gpu_splitter_debug or FLUX_SPLITTER_DEBUG env var)
+_gpu_splitter_debug = os.environ.get("FLUX_SPLITTER_DEBUG", "").lower() in ("1", "true", "yes")
+
+# Track if we've logged the initial debug state
+_debug_state_logged = False
+
+
+def set_gpu_splitter_debug(enabled: bool = True):
+    """Enable/disable debug logging for GPU splitter."""
+    global _gpu_splitter_debug
+    _gpu_splitter_debug = enabled
+    if enabled:
+        logger.info("[GPU Splitter] Debug logging ENABLED")
+
+
+def _log_debug(msg: str):
+    """Log debug message if debug mode is enabled."""
+    global _debug_state_logged
+    if _gpu_splitter_debug:
+        if not _debug_state_logged:
+            logger.info("[GPU Splitter] Debug mode active (set FLUX_SPLITTER_DEBUG=0 to disable)")
+            _debug_state_logged = True
+        logger.info(f"[GPU Splitter] {msg}")
 
 
 def _move_tensor_to_device(tensor: Tensor, device: torch.device) -> Tensor:
@@ -87,12 +118,18 @@ def split_gpu_double_block_forward(
     pe_ctx: Tensor,
     mod_img: tuple,
     mod_txt: tuple,
+    sync_per_block: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """
     Wrapped forward for DoubleStreamBlock that handles device transfers.
 
     Moves all inputs to the block's assigned GPU before calling the original forward.
-    Synchronizes to ensure transfers are complete before computation.
+    Synchronization is configurable - by default, we do NOT sync per-block to allow
+    pipelining. The event-based sync in the streamed path handles this properly.
+
+    Args:
+        sync_per_block: If True, synchronize device after transfers. Default False
+                       for better pipelining. Only enable if not using stream transfers.
     """
     device = self._split_device
 
@@ -106,8 +143,11 @@ def split_gpu_double_block_forward(
     mod_img = tuple(_move_tuple_to_device(m, device) for m in mod_img)
     mod_txt = tuple(_move_tuple_to_device(m, device) for m in mod_txt)
 
-    # Synchronize to ensure all transfers are complete
-    _synchronize_device(device)
+    # Optionally synchronize to ensure all transfers are complete
+    # By default OFF - the stream manager handles this via events
+    if sync_per_block:
+        _synchronize_device(device)
+        _log_debug(f"Synced double block on {device}")
 
     return self._pre_gpu_split_forward(img, txt, pe, pe_ctx, mod_img, mod_txt)
 
@@ -117,12 +157,16 @@ def split_gpu_single_block_forward(
     x: Tensor,
     pe: Tensor,
     mod: tuple,
+    sync_per_block: bool = False,
 ) -> Tensor:
     """
     Wrapped forward for SingleStreamBlock that handles device transfers.
 
     Moves all inputs to the block's assigned GPU before calling the original forward.
-    If this is the last block, routes output back to GPU 0.
+    If this is the last block, routes output back to the configured output device.
+
+    Args:
+        sync_per_block: If True, synchronize device after transfers. Default False.
     """
     device = self._split_device
 
@@ -133,15 +177,20 @@ def split_gpu_single_block_forward(
     # Move modulation tuple - (shift, scale, gate)
     mod = _move_tuple_to_device(mod, device)
 
-    # Synchronize to ensure all transfers are complete
-    _synchronize_device(device)
+    # Optionally synchronize to ensure all transfers are complete
+    if sync_per_block:
+        _synchronize_device(device)
+        _log_debug(f"Synced single block on {device}")
 
     x_out = self._pre_gpu_split_forward(x, pe, mod)
 
-    # Route output to specified device (used for last block to return to GPU 0)
+    # Route output to specified device (used for last block to return to output device)
     if hasattr(self, "_split_output_device"):
-        x_out = x_out.to(self._split_output_device, non_blocking=True)
-        _synchronize_device(self._split_output_device)
+        output_device = self._split_output_device
+        if x_out.device != output_device:
+            x_out = x_out.to(output_device, non_blocking=True)
+            if sync_per_block:
+                _synchronize_device(output_device)
 
     return x_out
 
@@ -163,15 +212,19 @@ def split_gpu_double_block_forward_streamed(
     Stream-based forward for DoubleStreamBlock with overlapped transfers.
 
     Uses DeviceTransferManager for fine-grained event-based synchronization
-    instead of blocking device synchronization.
+    instead of blocking device synchronization. Falls back to non-streamed
+    path if no manager is active.
     """
     device = self._split_device
     mgr = get_transfer_manager()
 
     if mgr is None:
-        # Fallback to blocking behavior
+        # Fallback to blocking behavior - use model's configured sync_per_block
+        # (defaults to False if not set, which is correct for pipelining)
+        sync_per_block = getattr(self, '_sync_per_block', False)
+        _log_debug(f"Streamed wrapper fallback: using sync_per_block={sync_per_block}")
         return split_gpu_double_block_forward(
-            self, img, txt, pe, pe_ctx, mod_img, mod_txt
+            self, img, txt, pe, pe_ctx, mod_img, mod_txt, sync_per_block=sync_per_block
         )
 
     # Transfer main tensors on the transfer stream
@@ -216,8 +269,10 @@ def split_gpu_single_block_forward_streamed(
     mgr = get_transfer_manager()
 
     if mgr is None:
-        # Fallback to blocking behavior
-        return split_gpu_single_block_forward(self, x, pe, mod)
+        # Fallback to blocking behavior - use model's configured sync_per_block
+        sync_per_block = getattr(self, '_sync_per_block', False)
+        _log_debug(f"Streamed wrapper fallback (single): using sync_per_block={sync_per_block}")
+        return split_gpu_single_block_forward(self, x, pe, mod, sync_per_block=sync_per_block)
 
     # Transfer main tensors
     x, pe = mgr.transfer_tensors((x, pe), target_device=device)
@@ -242,8 +297,9 @@ def split_gpu_single_block_forward_streamed(
     # Handle output routing for last block
     if hasattr(self, "_split_output_device"):
         output_device = self._split_output_device
-        x_out, = mgr.transfer_tensors((x_out,), target_device=output_device)
-        mgr.wait_for_transfer(output_device)
+        if x_out.device != output_device:
+            x_out, = mgr.transfer_tensors((x_out,), target_device=output_device)
+            mgr.wait_for_transfer(output_device)
 
     return x_out
 
@@ -264,6 +320,10 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
     - .to(device, dtype) - both
     - .to(device=..., dtype=...) - kwargs form
     - .to("cpu") - moves ALL layers to CPU, clears split device assignments
+
+    Validation:
+    - After moving back to CUDA from CPU, validates that split device topology
+      is still valid (same number of GPUs available)
     """
     # Parse device and dtype from args/kwargs robustly
     device = None
@@ -284,6 +344,9 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
             else:
                 remaining_args.append(arg)
         elif isinstance(arg, str) and ('cuda' in arg.lower() or 'cpu' in arg.lower()):
+            # NOTE: Only 'cuda' and 'cpu' device strings are parsed here.
+            # 'meta' and other device types (mps, xpu) pass through as remaining_args
+            # and won't trigger GPU split topology restoration logic.
             if device is None:
                 device = torch.device(arg)
             else:
@@ -305,6 +368,62 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
 
     # Check if moving to CPU - this requires special handling
     moving_to_cpu = has_device and device is not None and device.type == "cpu"
+
+    # Check if moving from CPU to CUDA
+    moving_to_cuda = (
+        has_device
+        and device is not None
+        and device.type == "cuda"
+        and hasattr(self, '_split_devices')
+    )
+
+    # Validate GPU topology when moving back to CUDA
+    if moving_to_cuda:
+        available_gpus = torch.cuda.device_count()
+        required_gpus = len(self._split_devices) if hasattr(self, '_split_devices') else 0
+
+        if required_gpus > available_gpus:
+            # Cannot restore - clear split metadata and warn
+            _log_debug(f"WARNING: Model was split across {required_gpus} GPUs but only "
+                       f"{available_gpus} are available. Clearing stale split metadata.")
+            print(f"[GPU Splitter] WARNING: Cannot restore GPU split - required {required_gpus} GPUs "
+                  f"but only {available_gpus} available. Falling back to single-device mode.")
+            # Clear stale split metadata
+            if hasattr(self, '_split_devices'):
+                delattr(self, '_split_devices')
+            if hasattr(self, '_use_stream_transfers'):
+                delattr(self, '_use_stream_transfers')
+            if hasattr(self, '_sync_per_block'):
+                delattr(self, '_sync_per_block')
+            if hasattr(self, '_output_device'):
+                delattr(self, '_output_device')
+            # Reset all blocks to single-device mode
+            for block in self.double_blocks:
+                _reset_block(block)
+            for block in self.single_blocks:
+                _reset_block(block)
+            # NOTE: We intentionally keep self.to as this wrapper (not restoring _pre_gpu_split_to)
+            # so future .to() calls still get smart device handling. The wrapper gracefully handles
+            # the "no split" case via the has_device branch below.
+            # Fall through to standard .to() behavior
+            moving_to_cuda = False  # Treat as normal move, no split restoration
+        else:
+            # Validate each GPU index in _split_devices
+            for i, split_dev in enumerate(self._split_devices):
+                if split_dev.type == 'cuda' and split_dev.index >= available_gpus:
+                    _log_debug(f"WARNING: Split device {split_dev} (index {split_dev.index}) "
+                               f"exceeds available GPUs ({available_gpus})")
+                    print(f"[GPU Splitter] WARNING: Stale split device {split_dev} detected. "
+                          f"Clearing split metadata.")
+                    # Clear and fall back
+                    if hasattr(self, '_split_devices'):
+                        delattr(self, '_split_devices')
+                    for block in self.double_blocks:
+                        _reset_block(block)
+                    for block in self.single_blocks:
+                        _reset_block(block)
+                    moving_to_cuda = False
+                    break
 
     # Helper to call .to() with or without device argument
     def to_with_optional_device(module, target_device):
@@ -333,18 +452,42 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
     self.single_stream_modulation = to_with_optional_device(self.single_stream_modulation, device)
 
     # Move transformer blocks
+    #
+    # Block device assignment has three modes:
+    #   1. moving_to_cpu=True: Stash original _split_device in _original_split_device,
+    #      then move all blocks to CPU. Preserves split topology for later restoration.
+    #   2. moving_to_cuda=True: Restore the multi-GPU split topology from _original_split_device.
+    #      Only active when _split_devices exists and GPU count is sufficient.
+    #   3. has_device=True with moving_to_cuda=False: Topology was cleared (GPU count shrank)
+    #      or never had a split. Behaves like normal .to(device), no split assumptions.
+    #
+    # _original_split_device lifecycle:
+    #   - Created on first .to(cpu) to remember where block belonged in the split
+    #   - Restored on .to(cuda) when topology is still valid
+    #   - Cleared by _reset_block() when topology fails permanently
+    #
     for i, block in enumerate(self.double_blocks):
         if moving_to_cpu:
             # CPU mode: all blocks go to CPU, stash original split device
             if not hasattr(block, "_original_split_device"):
-                block._original_split_device = block._split_device
+                block._original_split_device = getattr(block, "_split_device", device)
             block._split_device = device
             block_device = device
-        elif has_device:
-            # CUDA mode: restore original split device if coming from CPU
+        elif moving_to_cuda:
+            # Restoring a valid split topology from CPU
             if hasattr(block, "_original_split_device"):
                 block._split_device = block._original_split_device
             block_device = block._split_device
+        elif has_device:
+            # Split metadata was cleared (topology failure) or never had a split:
+            # restore _original_split_device if available, else use target device
+            if hasattr(block, "_original_split_device"):
+                block._split_device = block._original_split_device
+                block_device = block._split_device
+            else:
+                # No split history - just move to target device
+                block._split_device = device
+                block_device = device
         else:
             # dtype-only: no device change
             block_device = None
@@ -353,13 +496,23 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
     for i, block in enumerate(self.single_blocks):
         if moving_to_cpu:
             if not hasattr(block, "_original_split_device"):
-                block._original_split_device = block._split_device
+                block._original_split_device = getattr(block, "_split_device", device)
             block._split_device = device
             block_device = device
-        elif has_device:
+        elif moving_to_cuda:
+            # Restoring a valid split topology from CPU
             if hasattr(block, "_original_split_device"):
                 block._split_device = block._original_split_device
             block_device = block._split_device
+        elif has_device:
+            # Split metadata was cleared or never had a split:
+            # restore _original_split_device if available, else use target device
+            if hasattr(block, "_original_split_device"):
+                block._split_device = block._original_split_device
+                block_device = block._split_device
+            else:
+                block._split_device = device
+                block_device = device
         else:
             block_device = None
         self.single_blocks[i] = to_with_optional_device(block, block_device)
@@ -374,11 +527,17 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
             if not hasattr(last_block, "_original_split_output_device"):
                 last_block._original_split_output_device = getattr(last_block, "_split_output_device", device)
             last_block._split_output_device = device
-        else:
+        elif moving_to_cuda:
+            # Restoring valid split topology: use original split output device if available
             if hasattr(last_block, "_original_split_output_device"):
                 last_block._split_output_device = last_block._original_split_output_device
-            else:
-                last_block._split_output_device = device
+            # If no original, leave _split_output_device as-is (should still exist)
+        else:
+            # Split metadata was cleared or never had a split: set to target device
+            last_block._split_output_device = device
+
+    _log_debug(f"Model .to() completed: device={device}, dtype={dtype}, "
+               f"has_split={hasattr(self, '_split_devices')}")
 
     return self
 
@@ -389,7 +548,8 @@ def _reset_block(block):
     if orig_forward is not None:
         block.forward = orig_forward  # restore original first
     for attr in ("_original_split_device", "_original_split_output_device",
-                 "_pre_gpu_split_forward", "_split_device", "_split_output_device"):
+                 "_pre_gpu_split_forward", "_split_device", "_split_output_device",
+                 "_sync_per_block"):
         if hasattr(block, attr):
             delattr(block, attr)
 
@@ -400,6 +560,8 @@ def _apply_deterministic_split(
     double_split: List[int],
     single_split: List[int],
     use_stream_transfers: bool = False,
+    sync_per_block: bool = False,
+    output_device: Optional[torch.device] = None,
 ):
     """
     Apply deterministic block distribution based on explicit per-GPU counts.
@@ -410,20 +572,46 @@ def _apply_deterministic_split(
         double_split: Number of double blocks per GPU (must sum to 8)
         single_split: Number of single blocks per GPU (must sum to 48)
         use_stream_transfers: If True, use stream-based forward wrappers for overlapped transfers
+        sync_per_block: If True, synchronize after each block's transfers (default False for perf)
+        output_device: Device where final output should go (default: gpu_ids[0])
     """
+    # Validate split sums match actual block counts
+    num_double = len(transformer.double_blocks)
+    num_single = len(transformer.single_blocks)
+    if sum(double_split) != num_double:
+        raise ValueError(
+            f"gpu_split_double sums to {sum(double_split)}, but model has {num_double} double blocks. "
+            f"Split must sum to exactly {num_double}."
+        )
+    if sum(single_split) != num_single:
+        raise ValueError(
+            f"gpu_split_single sums to {sum(single_split)}, but model has {num_single} single blocks. "
+            f"Split must sum to exactly {num_single}."
+        )
+
     print(f"[GPU Splitter] Using deterministic split:")
     print(f"  Double blocks per GPU: {double_split}")
     print(f"  Single blocks per GPU: {single_split}")
     if use_stream_transfers:
         print(f"  Stream-based transfers: ENABLED")
+    if sync_per_block:
+        print(f"  Per-block sync: ENABLED (may reduce throughput)")
+
+    # Determine output device
+    if output_device is None:
+        output_device = torch.device(f"cuda:{gpu_ids[0]}")
+    print(f"  Output device: {output_device}")
 
     # Select forward wrapper based on stream transfer setting
     if use_stream_transfers and STREAM_MANAGER_AVAILABLE:
         double_forward_fn = split_gpu_double_block_forward_streamed
         single_forward_fn = split_gpu_single_block_forward_streamed
     else:
-        double_forward_fn = split_gpu_double_block_forward
-        single_forward_fn = split_gpu_single_block_forward
+        # Bind sync_per_block to the non-streamed wrappers
+        double_forward_fn = lambda self, img, txt, pe, pe_ctx, mod_img, mod_txt: \
+            split_gpu_double_block_forward(self, img, txt, pe, pe_ctx, mod_img, mod_txt, sync_per_block)
+        single_forward_fn = lambda self, x, pe, mod: \
+            split_gpu_single_block_forward(self, x, pe, mod, sync_per_block)
 
     block_distribution = {gpu_id: {"double": 0, "single": 0} for gpu_id in gpu_ids}
 
@@ -438,6 +626,7 @@ def _apply_deterministic_split(
             block._pre_gpu_split_forward = block.forward
             block.forward = partial(double_forward_fn, block)
             block._split_device = device
+            block._sync_per_block = sync_per_block  # For streamed wrapper fallback
             block_distribution[gpu_ids[gpu_idx]]["double"] += 1
             block_idx += 1
 
@@ -452,25 +641,31 @@ def _apply_deterministic_split(
             block._pre_gpu_split_forward = block.forward
             block.forward = partial(single_forward_fn, block)
             block._split_device = device
+            block._sync_per_block = sync_per_block  # For streamed wrapper fallback
             block_distribution[gpu_ids[gpu_idx]]["single"] += 1
             block_idx += 1
 
-    # Force last single block to route output back to GPU 0
-    transformer.single_blocks[-1]._split_output_device = torch.device(f"cuda:{gpu_ids[0]}")
+    # Set last single block to route output to output_device
+    # This ensures the final tensor ends up on the correct device for loss computation
+    transformer.single_blocks[-1]._split_output_device = output_device
+    _log_debug(f"Last block output device set to {output_device}")
 
     # Log distribution
     print("[GPU Splitter] Block distribution:")
     for gpu_id in gpu_ids:
         counts = block_distribution[gpu_id]
         print(f"  GPU {gpu_id}: {counts['double']} double blocks, {counts['single']} single blocks")
+    print(f"  Final output routed to: {output_device}")
 
 
 def _apply_greedy_split(
     transformer: "Flux2",
     gpu_ids: List[int],
-    other_module_params: int,
+    other_module_params: float,
     other_module_param_count_scale: float,
     use_stream_transfers: bool = False,
+    sync_per_block: bool = False,
+    output_device: Optional[torch.device] = None,
 ):
     """
     Apply greedy parameter-based block distribution (legacy algorithm).
@@ -480,14 +675,23 @@ def _apply_greedy_split(
     print(f"[GPU Splitter] Using greedy parameter-based split")
     if use_stream_transfers:
         print(f"  Stream-based transfers: ENABLED")
+    if sync_per_block:
+        print(f"  Per-block sync: ENABLED")
+
+    # Determine output device
+    if output_device is None:
+        output_device = torch.device(f"cuda:{gpu_ids[0]}")
+    print(f"  Output device: {output_device}")
 
     # Select forward wrapper based on stream transfer setting
     if use_stream_transfers and STREAM_MANAGER_AVAILABLE:
         double_forward_fn = split_gpu_double_block_forward_streamed
         single_forward_fn = split_gpu_single_block_forward_streamed
     else:
-        double_forward_fn = split_gpu_double_block_forward
-        single_forward_fn = split_gpu_single_block_forward
+        double_forward_fn = lambda self, img, txt, pe, pe_ctx, mod_img, mod_txt: \
+            split_gpu_double_block_forward(self, img, txt, pe, pe_ctx, mod_img, mod_txt, sync_per_block)
+        single_forward_fn = lambda self, x, pe, mod: \
+            split_gpu_single_block_forward(self, x, pe, mod, sync_per_block)
 
     # Scale other module params
     other_module_params = other_module_params * other_module_param_count_scale
@@ -510,6 +714,7 @@ def _apply_greedy_split(
         double_block._pre_gpu_split_forward = double_block.forward
         double_block.forward = partial(double_forward_fn, double_block)
         double_block._split_device = device
+        double_block._sync_per_block = sync_per_block  # For streamed wrapper fallback
 
         block_distribution[gpu_ids[current_gpu_idx]]["double"] += 1
         current_gpu_params += sum(p.numel() for p in double_block.parameters())
@@ -525,6 +730,7 @@ def _apply_greedy_split(
         single_block._pre_gpu_split_forward = single_block.forward
         single_block.forward = partial(single_forward_fn, single_block)
         single_block._split_device = device
+        single_block._sync_per_block = sync_per_block  # For streamed wrapper fallback
 
         block_distribution[gpu_ids[current_gpu_idx]]["single"] += 1
         current_gpu_params += sum(p.numel() for p in single_block.parameters())
@@ -533,14 +739,17 @@ def _apply_greedy_split(
             current_gpu_idx += 1
             current_gpu_params = 0
 
-    # Force last single block to route output back to GPU 0
-    transformer.single_blocks[-1]._split_output_device = torch.device(f"cuda:{gpu_ids[0]}")
+    # Set last single block to route output to output_device
+    # This ensures the final tensor ends up on the correct device for loss computation
+    transformer.single_blocks[-1]._split_output_device = output_device
+    _log_debug(f"Last block output device set to {output_device}")
 
     # Log distribution
     print("[GPU Splitter] Block distribution:")
     for gpu_id in gpu_ids:
         counts = block_distribution[gpu_id]
         print(f"  GPU {gpu_id}: {counts['double']} double blocks, {counts['single']} single blocks")
+    print(f"  Final output routed to: {output_device}")
 
 
 def add_model_gpu_splitter_to_flux2(
@@ -550,8 +759,12 @@ def add_model_gpu_splitter_to_flux2(
     gpu_split_single: Optional[List[int]] = None,
     # Stream-based transfers for overlapped compute/transfer
     use_stream_transfers: bool = False,
+    # Per-block synchronization (default off for better pipelining)
+    sync_per_block: bool = False,
+    # Output device configuration
+    output_device: Optional[torch.device] = None,
     # Legacy greedy algorithm parameters (fallback)
-    other_module_params: Optional[int] = 25e9,
+    other_module_params: Optional[float] = 25e9,
     other_module_param_count_scale: Optional[float] = 0.3,
 ):
     """
@@ -562,7 +775,7 @@ def add_model_gpu_splitter_to_flux2(
     1. User-specified splits: If gpu_split_double and gpu_split_single are provided,
        uses those exact distributions.
 
-    2. Default deterministic splits: For 2 or 4 GPUs, uses pre-defined even splits
+    2. Default deterministic splits: For 2, 4, or 8 GPUs, uses pre-defined even splits
        that balance memory well for B300 GPUs.
 
     3. Greedy parameter-based: Falls back to the legacy algorithm that assigns
@@ -573,7 +786,13 @@ def add_model_gpu_splitter_to_flux2(
         gpu_split_double: List of double blocks per GPU, e.g., [4, 4] for 2 GPUs
         gpu_split_single: List of single blocks per GPU, e.g., [24, 24] for 2 GPUs
         use_stream_transfers: If True, use CUDA stream-based transfers for
-            overlapped compute/transfer (experimental, may improve throughput)
+            overlapped compute/transfer (recommended for best throughput)
+        sync_per_block: If True, synchronize device after each block's transfers.
+            Default False for better pipelining when using stream transfers.
+            Set True only if debugging transfer issues without stream manager.
+        output_device: Device where final output should reside. If None, uses
+            cuda:0 (the first GPU). This is important for loss computation and
+            backward pass - set this to match where your loss is computed.
         other_module_params: Estimated parameter count for non-transformer modules
         other_module_param_count_scale: Multiplier for other_module_params
 
@@ -586,6 +805,17 @@ def add_model_gpu_splitter_to_flux2(
         GPU 1: 2 double + 12 single (~25GB)
         GPU 2: 2 double + 12 single (~25GB)
         GPU 3: 2 double + 12 single (~25GB)
+
+    Notes on Synchronization:
+        - With use_stream_transfers=True: The DeviceTransferManager handles all
+          synchronization via CUDA events. sync_per_block has no effect.
+        - With use_stream_transfers=False and sync_per_block=False (default):
+          Tensors are transferred with non_blocking=True but no explicit sync.
+          PyTorch's default stream ordering ensures correctness, but there's
+          no overlap between compute and transfer.
+        - With use_stream_transfers=False and sync_per_block=True:
+          Each block waits for transfers to complete before compute. This is
+          the safest but slowest option - use only for debugging.
     """
     gpu_ids = list(range(torch.cuda.device_count()))
     n_gpus = len(gpu_ids)
@@ -629,20 +859,29 @@ def add_model_gpu_splitter_to_flux2(
     if use_deterministic:
         _apply_deterministic_split(
             transformer, gpu_ids, double_split, single_split,
-            use_stream_transfers=use_stream_transfers
+            use_stream_transfers=use_stream_transfers,
+            sync_per_block=sync_per_block,
+            output_device=output_device,
         )
     else:
         _apply_greedy_split(
             transformer, gpu_ids, other_module_params, other_module_param_count_scale,
-            use_stream_transfers=use_stream_transfers
+            use_stream_transfers=use_stream_transfers,
+            sync_per_block=sync_per_block,
+            output_device=output_device,
         )
 
     # Store list of devices for stream manager initialization
     transformer._split_devices = [torch.device(f"cuda:{gpu_id}") for gpu_id in gpu_ids]
     transformer._use_stream_transfers = use_stream_transfers
+    transformer._sync_per_block = sync_per_block
+    transformer._output_device = output_device if output_device is not None else torch.device(f"cuda:{gpu_ids[0]}")
 
     # Wrap the .to() method to respect GPU splitting
     transformer._pre_gpu_split_to = transformer.to
     transformer.to = partial(new_device_to_flux2, transformer)
 
     print("[GPU Splitter] FLUX.2 model splitting complete")
+    if use_stream_transfers:
+        print("[GPU Splitter] NOTE: Stream transfers enabled. Ensure DeviceTransferManager is")
+        print("              instantiated in get_noise_prediction() for this to take effect.")
