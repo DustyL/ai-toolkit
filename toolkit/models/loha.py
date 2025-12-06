@@ -361,8 +361,8 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
 
         if isinstance(multiplier, (int, float)):
             multiplier = torch.tensor(multiplier, device=device, dtype=dtype)
-        elif multiplier.device != device:
-            multiplier = multiplier.to(device=device)
+        elif multiplier.device != device or multiplier.dtype != dtype:
+            multiplier = multiplier.to(device=device, dtype=dtype)
 
         merged_weight = orig_weight + loha_weight * multiplier
 
@@ -447,8 +447,12 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
         # Use bypass_mode=True for true per-sample multiplier support.
         if multiplier.numel() > 1:
             multiplier = torch.mean(multiplier)
-        if multiplier.device != device:
-            multiplier = multiplier.to(device=device)
+        # Ensure multiplier matches target device/dtype to avoid dtype promotion
+        if isinstance(multiplier, (int, float)):
+            multiplier = torch.tensor(multiplier, device=device, dtype=orig_dtype)
+        else:
+            if multiplier.device != device or multiplier.dtype != orig_dtype:
+                multiplier = multiplier.to(device=device, dtype=orig_dtype)
 
         if self.weight_decompose:
             weight = self.get_merged_weight_with_dora(orig_weight, multiplier, device=device, dtype=orig_dtype)
@@ -522,8 +526,11 @@ class LohaModule(ToolkitModuleMixin, nn.Module):
         # This mode supports per-sample multipliers (no averaging needed)
         if self.bypass_mode:
             multiplier = self.network_ref().torch_multiplier
-            if multiplier.device != x.device:
-                multiplier = multiplier.to(device=x.device)
+            # Ensure multiplier matches input device/dtype to avoid promotion
+            if isinstance(multiplier, (int, float)):
+                multiplier = torch.tensor(multiplier, device=x.device, dtype=x.dtype)
+            elif multiplier.device != x.device or multiplier.dtype != x.dtype:
+                multiplier = multiplier.to(device=x.device, dtype=x.dtype)
             return self._bypass_forward(x, scale=multiplier)
 
         return self._call_forward(x)
