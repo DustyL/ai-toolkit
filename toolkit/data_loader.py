@@ -13,6 +13,7 @@ from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 import albumentations as A
 
@@ -651,6 +652,7 @@ def get_dataloader_from_datasets(
         dataset_options,
         batch_size=1,
         sd: 'StableDiffusion' = None,
+        distributed: bool = False,
 ) -> DataLoader:
     if dataset_options is None or len(dataset_options) == 0:
         return None
@@ -697,7 +699,21 @@ def get_dataloader_from_datasets(
     # check if is caching latents
 
     dataloader_kwargs = {}
-    
+
+    # Create distributed sampler if in distributed mode
+    sampler = None
+    shuffle = True
+    if distributed:
+        from toolkit.distributed import get_rank, get_world_size
+        sampler = DistributedSampler(
+            concatenated_dataset,
+            num_replicas=get_world_size(),
+            rank=get_rank(),
+            shuffle=True,
+            drop_last=True
+        )
+        shuffle = False  # Sampler handles shuffling
+
     if is_native_windows():
         dataloader_kwargs['num_workers'] = 0
     else:
@@ -713,7 +729,8 @@ def get_dataloader_from_datasets(
             concatenated_dataset,
             batch_size=None,  # we batch in the datasets for now
             drop_last=False,
-            shuffle=True,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             collate_fn=dto_collation,  # Use the custom collate function
             **dataloader_kwargs
         )
@@ -721,7 +738,8 @@ def get_dataloader_from_datasets(
         data_loader = DataLoader(
             concatenated_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             collate_fn=dto_collation,
             **dataloader_kwargs
         )

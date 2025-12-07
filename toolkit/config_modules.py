@@ -581,6 +581,16 @@ class TrainConfig:
         # for multi stage models, how often to switch the boundary
         self.switch_boundary_every: int = kwargs.get('switch_boundary_every', 1)
 
+        # Distributed training settings
+        self.distributed: bool = kwargs.get('distributed', False)
+        self.dist_backend: str = kwargs.get('dist_backend', 'nccl')  # nccl for GPU, gloo for CPU
+        self.dist_mode: str = kwargs.get('dist_mode', 'ddp')  # ddp or fsdp
+        
+        # FSDP-specific settings (only used when dist_mode='fsdp')
+        self.fsdp_auto_wrap: bool = kwargs.get('fsdp_auto_wrap', True)
+        self.fsdp_sharding: str = kwargs.get('fsdp_sharding', 'full')  # full or hybrid
+        self.fsdp_mixed_precision: str = kwargs.get('fsdp_mixed_precision', 'bf16')  # bf16 or fp16 or none
+
 
 ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flux2', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
 

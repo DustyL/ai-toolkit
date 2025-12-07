@@ -72,6 +72,23 @@ import hashlib
 
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
+from toolkit.distributed import (
+    init_distributed,
+    is_main,
+    get_rank,
+    get_world_size,
+    get_local_rank,
+    is_distributed,
+    cleanup,
+    barrier,
+)
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from toolkit.fsdp_utils import (
+    get_flux2_wrap_policy,
+    get_fsdp_mixed_precision,
+    validate_fsdp_config,
+)
 
 def flush():
     torch.cuda.empty_cache()
@@ -103,7 +120,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # if true, then we do not do an optimizer step. We are accumulating gradients
         self.is_grad_accumulation_step = False
         self.device = str(self.accelerator.device)
-        self.device_torch = self.accelerator.device
+        # Check for distributed training in raw config
+        train_raw = self.get_conf('train', {})
+        self.distributed_enabled = train_raw.get('distributed', False)
+
+        if self.distributed_enabled:
+            init_distributed(backend=train_raw.get('dist_backend', 'nccl'))
+            self.local_rank = get_local_rank()
+            self.device_torch = torch.device(f"cuda:{self.local_rank}")
+            self.is_main_process = is_main()
+        else:
+            self.device_torch = self.accelerator.device
+            self.local_rank = 0
+            self.is_main_process = self.accelerator.is_local_main_process
         network_config = self.get_conf('network', None)
         if network_config is not None:
             self.network_config = NetworkConfig(**network_config)
@@ -270,7 +299,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return generate_image_config_list
 
     def sample(self, step=None, is_first=False):
-        if not self.accelerator.is_main_process:
+        if not self.is_main_process:
             return
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
@@ -405,7 +434,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return info
 
     def clean_up_saves(self):
-        if not self.accelerator.is_main_process:
+        if not self.is_main_process:
             return
         # remove old saves
         # get latest saved step
@@ -492,7 +521,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
 
     def save(self, step=None):
-        if not self.accelerator.is_main_process:
+        if not self.is_main_process:
             return
         flush()
         if self.ema is not None:
@@ -701,7 +730,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return params
 
     def hook_before_train_loop(self):
-        if self.accelerator.is_main_process:
+        if self.is_main_process:
             self.logger.start()
         self.prepare_accelerator()
         
@@ -712,6 +741,194 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set some config
         self.accelerator.even_batches=False
         
+        # Check if using distributed mode
+        train_raw = self.get_conf('train', {})
+        dist_mode = train_raw.get('dist_mode', 'ddp')
+        
+        if self.distributed_enabled and dist_mode == 'fsdp':
+            # Use PyTorch FSDP
+            self._prepare_with_fsdp()
+        elif self.distributed_enabled and dist_mode == 'ddp':
+            # Use PyTorch DDP directly
+            self._prepare_with_ddp()
+        else:
+            # Use accelerator (default path)
+            self._prepare_with_accelerator()
+
+    def _prepare_with_ddp(self):
+        """Prepare models using PyTorch DistributedDataParallel."""
+        from toolkit.distributed import barrier
+        
+        # Synchronize before wrapping
+        barrier()
+        
+        # VAE doesn't need DDP (not trained)
+        # self.sd.vae stays as-is
+        
+        if self.sd.unet is not None:
+            self.sd.unet = DDP(
+                self.sd.unet,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=False
+            )
+            self.modules_being_trained.append(self.sd.unet)
+            
+        if self.sd.text_encoder is not None and self.train_config.train_text_encoder:
+            if isinstance(self.sd.text_encoder, list):
+                self.sd.text_encoder = [
+                    DDP(te, device_ids=[self.local_rank], output_device=self.local_rank,
+                        broadcast_buffers=False, find_unused_parameters=False)
+                    for te in self.sd.text_encoder
+                ]
+                self.modules_being_trained.extend(self.sd.text_encoder)
+            else:
+                self.sd.text_encoder = DDP(
+                    self.sd.text_encoder,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    broadcast_buffers=False,
+                    find_unused_parameters=False
+                )
+                self.modules_being_trained.append(self.sd.text_encoder)
+                
+        if self.sd.refiner_unet is not None and self.train_config.train_refiner:
+            self.sd.refiner_unet = DDP(
+                self.sd.refiner_unet,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=False
+            )
+            self.modules_being_trained.append(self.sd.refiner_unet)
+            
+        if self.sd.network is not None:
+            self.sd.network = DDP(
+                self.sd.network,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=False
+            )
+            self.modules_being_trained.append(self.sd.network)
+            
+        if self.adapter is not None and self.adapter_config.train:
+            self.adapter = DDP(
+                self.adapter,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=False
+            )
+            self.modules_being_trained.append(self.adapter)
+        
+        # Optimizer and scheduler don't need DDP wrapping
+        # self.optimizer stays as-is
+        # self.lr_scheduler stays as-is
+        
+        barrier()
+
+    def _prepare_with_fsdp(self):
+        """Prepare models using PyTorch FullyShardedDataParallel (FSDP)."""
+        from toolkit.distributed import barrier
+        from toolkit.fsdp_utils import get_flux2_wrap_policy, get_fsdp_mixed_precision
+        
+        barrier()
+        
+        # Get FSDP configuration from train config
+        train_raw = self.get_conf('train', {})
+        fsdp_mixed_precision = train_raw.get('fsdp_mixed_precision', 'bf16')
+        fsdp_cpu_offload = train_raw.get('fsdp_cpu_offload', False)
+        
+        # Build FSDP config
+        mixed_precision = get_fsdp_mixed_precision(fsdp_mixed_precision)
+        auto_wrap_policy = get_flux2_wrap_policy()
+        
+        # Optional CPU offload
+        cpu_offload = None
+        if fsdp_cpu_offload:
+            from torch.distributed.fsdp import CPUOffload
+            cpu_offload = CPUOffload(offload_params=True)
+        
+        # VAE doesn't need FSDP (not trained, frozen)
+        # self.sd.vae stays as-is
+        
+        # Wrap UNet/Transformer with FSDP using auto-wrap policy
+        if self.sd.unet is not None:
+            self.sd.unet = FSDP(
+                self.sd.unet,
+                auto_wrap_policy=auto_wrap_policy,
+                mixed_precision=mixed_precision,
+                cpu_offload=cpu_offload,
+                device_id=self.local_rank,
+                use_orig_params=True,  # Required for optimizer param groups
+            )
+            self.modules_being_trained.append(self.sd.unet)
+        
+        # Text encoder - wrap at top level only (no recursive auto-wrap)
+        if self.sd.text_encoder is not None and self.train_config.train_text_encoder:
+            if isinstance(self.sd.text_encoder, list):
+                self.sd.text_encoder = [
+                    FSDP(
+                        te,
+                        mixed_precision=mixed_precision,
+                        cpu_offload=cpu_offload,
+                        device_id=self.local_rank,
+                        use_orig_params=True,
+                    )
+                    for te in self.sd.text_encoder
+                ]
+                self.modules_being_trained.extend(self.sd.text_encoder)
+            else:
+                self.sd.text_encoder = FSDP(
+                    self.sd.text_encoder,
+                    mixed_precision=mixed_precision,
+                    cpu_offload=cpu_offload,
+                    device_id=self.local_rank,
+                    use_orig_params=True,
+                )
+                self.modules_being_trained.append(self.sd.text_encoder)
+        
+        # Refiner UNet - same as main UNet
+        if self.sd.refiner_unet is not None and self.train_config.train_refiner:
+            self.sd.refiner_unet = FSDP(
+                self.sd.refiner_unet,
+                auto_wrap_policy=auto_wrap_policy,
+                mixed_precision=mixed_precision,
+                cpu_offload=cpu_offload,
+                device_id=self.local_rank,
+                use_orig_params=True,
+            )
+            self.modules_being_trained.append(self.sd.refiner_unet)
+        
+        # Network (LoRA/LoHA/LoKr/etc) - wrap at top-level ONLY (no recursive)
+        # The network hooks into the transformer which is already FSDP-wrapped
+        if self.sd.network is not None:
+            self.sd.network = FSDP(
+                self.sd.network,
+                mixed_precision=mixed_precision,
+                cpu_offload=cpu_offload,
+                device_id=self.local_rank,
+                use_orig_params=True,
+            )
+            self.modules_being_trained.append(self.sd.network)
+        
+        # Adapter - top-level wrap only
+        if self.adapter is not None and self.adapter_config.train:
+            self.adapter = FSDP(
+                self.adapter,
+                mixed_precision=mixed_precision,
+                cpu_offload=cpu_offload,
+                device_id=self.local_rank,
+                use_orig_params=True,
+            )
+            self.modules_being_trained.append(self.adapter)
+        
+        barrier()
+
+    def _prepare_with_accelerator(self):
+        """Prepare models using HuggingFace Accelerate (original path)."""
         # # prepare all the models stuff for accelerator (hopefully we dont miss any)
         self.sd.vae = self.accelerator.prepare(self.sd.vae)
         if self.sd.unet is not None:
@@ -741,10 +958,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.optimizer = self.accelerator.prepare(self.optimizer)
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
-        # self.data_loader = self.accelerator.prepare(self.data_loader)
-        # if self.data_loader_reg is not None:
-        #     self.data_loader_reg = self.accelerator.prepare(self.data_loader_reg)
-            
 
     def ensure_params_requires_grad(self, force=False):
         if self.train_config.do_paramiter_swapping and not force:
@@ -820,7 +1033,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return latest_path
 
     def load_training_state_from_metadata(self, path):
-        if not self.accelerator.is_main_process:
+        if not self.is_main_process:
             return
         meta = None
         # if path is folder, then it is diffusers
@@ -1511,6 +1724,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
+
+        # Validate FSDP configuration before proceeding
+        train_raw = self.get_conf('train', {})
+        if train_raw.get('dist_mode') == 'fsdp':
+            from toolkit.fsdp_utils import validate_fsdp_config
+            errors = validate_fsdp_config(train_raw)
+            if errors:
+                error_msg = "FSDP configuration errors:\n" + "\n".join(f"  - {e}" for e in errors)
+                raise ValueError(error_msg)
+
         params = []
 
         ### HOOK ###
@@ -2031,10 +2254,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.before_dataset_load()
         # load datasets if passed in the root process
         if self.datasets is not None:
-            self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
+            self.data_loader = get_dataloader_from_datasets(
+                self.datasets,
+                self.train_config.batch_size,
+                self.sd,
+                distributed=self.distributed_enabled
+            )
         if self.datasets_reg is not None:
-            self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
-                                                                self.sd)
+            self.data_loader_reg = get_dataloader_from_datasets(
+                self.datasets_reg,
+                self.train_config.batch_size,
+                self.sd,
+                distributed=self.distributed_enabled
+            )
 
         flush()
         self.last_save_step = self.step_num
@@ -2052,7 +2284,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc("Generating baseline samples before training")
             self.sample(self.step_num)
         
-        if self.accelerator.is_local_main_process:
+        if self.is_main_process:
             self.progress_bar = ToolkitProgressBar(
                 total=self.train_config.steps,
                 desc=self.job.name,
@@ -2311,7 +2543,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             self.progress_bar.pause()
                         with self.timer('log_to_tensorboard'):
                             # log to tensorboard
-                            if self.accelerator.is_main_process:
+                            if self.is_main_process:
                                 if self.writer is not None:
                                     for key, value in loss_dict.items():
                                         self.writer.add_scalar(f"{key}", value, self.step_num)
@@ -2319,7 +2551,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
                         
-                        if self.accelerator.is_main_process:
+                        if self.is_main_process:
                             # log to logger
                             self.logger.log({
                                 'learning_rate': learning_rate,
@@ -2329,7 +2561,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     f'loss/{key}': value,
                                 })
                     elif self.logging_config.log_every is None:
-                        if self.accelerator.is_main_process:
+                        if self.is_main_process:
                             # log every step
                             self.logger.log({
                                 'learning_rate': learning_rate,
@@ -2350,7 +2582,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             self.progress_bar.unpause()
                 
                 # commit log
-                if self.accelerator.is_main_process:
+                if self.is_main_process:
                     self.logger.commit(step=self.step_num)
 
                 # sets progress bar to match out step
@@ -2379,12 +2611,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sample(self.step_num)
             self.logger.commit(step=self.step_num)
         print_acc("")
-        if self.accelerator.is_main_process:
+        if self.is_main_process:
             self.save()
             self.logger.finish()
         self.accelerator.end_training()
 
-        if self.accelerator.is_main_process:
+        if self.is_main_process:
             # push to hub
             if self.save_config.push_to_hub:
                 if("HF_TOKEN" not in os.environ):
@@ -2424,7 +2656,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
     repo_id: str,
     private: bool = False,
     ):  
-        if not self.accelerator.is_main_process:
+        if not self.is_main_process:
             return
         readme_content = self._generate_readme(repo_id)
         readme_path = os.path.join(self.save_root, "README.md")
