@@ -307,7 +307,8 @@ class ToolkitModuleMixin:
         # Ensure multiplier is on the same device as this LoRA block's output.
         # With split_model_over_gpus, different blocks (and their LoRAs) sit on
         # different GPUs. torch_multiplier is created from the first module and
-        # may be on another device, so move it to the active block's device.
+        # may be on another device, so move it to the active block's device to
+        # avoid cross-device broadcast errors.
         multiplier = self.network_ref().torch_multiplier.to(lora_output.device)
 
         lora_output_batch_size = lora_output.size(0)

@@ -762,11 +762,189 @@ def _apply_greedy_split(
     print(f"  Final output routed to: {output_device}")
 
 
+def _apply_contiguous_split(
+    transformer: "Flux2",
+    gpu_ids: List[int],
+    other_module_params: float,
+    other_module_param_count_scale: float,
+    use_stream_transfers: bool = False,
+    sync_per_block: bool = False,
+    output_device: Optional[torch.device] = None,
+):
+    """
+    Apply contiguous block distribution optimized for 2 GPUs (e.g., 2x B200).
+
+    Pins all 8 double blocks to GPU 0, then finds the optimal split point within
+    single blocks to minimize parameter imbalance between GPUs. This guarantees
+    exactly 2 cross-GPU transfers: one at the single block split point, and one
+    returning to GPU 0 for final_layer.
+
+    Compared to greedy/deterministic splits that may interleave blocks across GPUs,
+    contiguous assignment reduces cross-GPU data transfers from 20-30+ to exactly 2.
+
+    Only supports 2 GPUs. Falls back to greedy for >2 GPUs with a warning.
+    """
+    if len(gpu_ids) > 2:
+        print("[GPU Splitter] WARNING: Contiguous strategy only supports 2 GPUs. "
+              f"Falling back to 'greedy' for {len(gpu_ids)} GPUs.")
+        print("[GPU Splitter] HINT: For 3+ GPUs, consider FSDP/DeepSpeed or use 'deterministic' strategy.")
+        _apply_greedy_split(
+            transformer, gpu_ids, other_module_params, other_module_param_count_scale,
+            use_stream_transfers=use_stream_transfers,
+            sync_per_block=sync_per_block,
+            output_device=output_device,
+        )
+        return
+
+    print(f"[GPU Splitter] Using contiguous split (optimized for 2 GPUs)")
+    if use_stream_transfers:
+        print(f"  Stream-based transfers: ENABLED")
+    if sync_per_block:
+        print(f"  Per-block sync: ENABLED")
+
+    # Determine output device
+    if output_device is None:
+        output_device = torch.device(f"cuda:{gpu_ids[0]}")
+    print(f"  Output device: {output_device}")
+
+    # Select forward wrapper based on stream transfer setting
+    if use_stream_transfers and STREAM_MANAGER_AVAILABLE:
+        double_forward_fn = split_gpu_double_block_forward_streamed
+        single_forward_fn = split_gpu_single_block_forward_streamed
+    else:
+        double_forward_fn = lambda self, img, txt, pe, pe_ctx, mod_img, mod_txt: \
+            split_gpu_double_block_forward(self, img, txt, pe, pe_ctx, mod_img, mod_txt, sync_per_block)
+        single_forward_fn = lambda self, x, pe, mod: \
+            split_gpu_single_block_forward(self, x, pe, mod, sync_per_block)
+
+    # Scale other module params (applied to GPU 0's starting load)
+    gpu0_starting_load = other_module_params * other_module_param_count_scale
+
+    # Track per-GPU param totals
+    gpu_param_totals = {gpu_id: 0 for gpu_id in gpu_ids}
+    gpu_param_totals[gpu_ids[0]] = gpu0_starting_load
+
+    block_distribution = {gpu_id: {"double": 0, "single": 0} for gpu_id in gpu_ids}
+
+    # Pre-calculate block params
+    double_params_list = [sum(p.numel() for p in b.parameters()) for b in transformer.double_blocks]
+    single_params_list = [sum(p.numel() for p in b.parameters()) for b in transformer.single_blocks]
+
+    total_double_params = sum(double_params_list)
+    total_single_params = sum(single_params_list)
+    total_block_params = total_double_params + total_single_params
+
+    print(f"[GPU Splitter] Total block params: {total_block_params/1e9:.2f}B "
+          f"({total_double_params/1e9:.2f}B double + {total_single_params/1e9:.2f}B single)")
+    print(f"[GPU Splitter] GPU0 extra load (TE/VAE estimate): {gpu0_starting_load/1e9:.2f}B")
+
+    # ============ PIN ALL DOUBLE BLOCKS TO GPU 0 ============
+    # Double blocks (8 total) process both img and txt streams and come first.
+    # Pinning them to GPU0 avoids mid-double transfers.
+    gpu0_device = torch.device(f"cuda:{gpu_ids[0]}")
+
+    for i, block in enumerate(transformer.double_blocks):
+        block._pre_gpu_split_forward = block.forward
+        block.forward = partial(double_forward_fn, block)
+        block._split_device = gpu0_device
+        block._sync_per_block = sync_per_block
+
+        block_distribution[gpu_ids[0]]["double"] += 1
+        gpu_param_totals[gpu_ids[0]] += double_params_list[i]
+
+    # ============ FIND OPTIMAL SINGLE BLOCK SPLIT POINT ============
+    # GPU 0 already has: TE/VAE + all doubles
+    # Find the split point that minimizes |params_gpu0 - params_gpu1|
+
+    if not single_params_list:
+        print("[GPU Splitter] WARNING: No single blocks found, all work on GPU0")
+        split_idx = 0
+        best_diff = 0.0
+    else:
+        gpu0_base = gpu0_starting_load + total_double_params
+
+        # Compute cumulative sums for singles
+        single_cumsum = []
+        running = 0
+        for params in single_params_list:
+            running += params
+            single_cumsum.append(running)
+
+        # Find split index that minimizes imbalance: O(N) scan
+        # split_idx=k means singles[0:k] on GPU0, singles[k:] on GPU1
+        best_split_idx = 0
+        best_diff = float('inf')
+
+        for k in range(len(single_params_list) + 1):
+            if k == 0:
+                gpu0_total = gpu0_base
+                gpu1_total = total_single_params
+            else:
+                gpu0_total = gpu0_base + single_cumsum[k - 1]
+                gpu1_total = total_single_params - single_cumsum[k - 1]
+
+            diff = abs(gpu0_total - gpu1_total)
+            if diff < best_diff:
+                best_diff = diff
+                best_split_idx = k
+
+        split_idx = best_split_idx
+
+    # Assign single blocks contiguously
+    gpu1_device = torch.device(f"cuda:{gpu_ids[1]}")
+
+    for i, block in enumerate(transformer.single_blocks):
+        if i < split_idx:
+            device = gpu0_device
+            current_gpu_idx = 0
+        else:
+            device = gpu1_device
+            current_gpu_idx = 1
+
+        block._pre_gpu_split_forward = block.forward
+        block.forward = partial(single_forward_fn, block)
+        block._split_device = device
+        block._sync_per_block = sync_per_block
+
+        block_distribution[gpu_ids[current_gpu_idx]]["single"] += 1
+        gpu_param_totals[gpu_ids[current_gpu_idx]] += single_params_list[i]
+
+    # Set last single block to route output to output_device
+    transformer.single_blocks[-1]._split_output_device = output_device
+    _log_debug(f"Last block output device set to {output_device}")
+
+    # Log split details with percentage
+    num_singles = len(transformer.single_blocks)
+    total_distributed = total_block_params + gpu0_starting_load
+    imbalance_pct = (best_diff / total_distributed * 100) if total_distributed > 0 else 0.0
+
+    if split_idx == 0:
+        print(f"[GPU Splitter] Contiguous split: all {num_singles} singles on GPU1 "
+              f"(imbalance: {best_diff/1e9:.2f}B, {imbalance_pct:.1f}%)")
+    elif split_idx == num_singles:
+        print(f"[GPU Splitter] Contiguous split: all {num_singles} singles on GPU0 "
+              f"(imbalance: {best_diff/1e9:.2f}B, {imbalance_pct:.1f}%)")
+    else:
+        print(f"[GPU Splitter] Contiguous split: singles 0-{split_idx-1} on GPU0, "
+              f"{split_idx}-{num_singles-1} on GPU1 (imbalance: {best_diff/1e9:.2f}B, {imbalance_pct:.1f}%)")
+
+    # Log distribution
+    print("[GPU Splitter] Block distribution:")
+    for gpu_id in gpu_ids:
+        counts = block_distribution[gpu_id]
+        params_b = gpu_param_totals[gpu_id] / 1e9
+        print(f"  GPU {gpu_id}: {counts['double']} double + {counts['single']} single blocks ({params_b:.2f}B params)")
+    print(f"  Final output routed to: {output_device}")
+    print(f"  Cross-GPU transfers: 2 (at single split point + return for final_layer)")
+
+
 def add_model_gpu_splitter_to_flux2(
     transformer: "Flux2",
     # User-specified splits (takes precedence if provided)
     gpu_split_double: Optional[List[int]] = None,
     gpu_split_single: Optional[List[int]] = None,
+    # Split strategy selection
+    split_strategy: Optional[str] = "contiguous",
     # Stream-based transfers for overlapped compute/transfer
     use_stream_transfers: bool = False,
     # Per-block synchronization (default off for better pipelining)
@@ -780,21 +958,29 @@ def add_model_gpu_splitter_to_flux2(
     """
     Apply GPU model splitting to a Flux2 transformer.
 
-    Distributes transformer blocks across all available GPUs. Supports three modes:
+    Distributes transformer blocks across all available GPUs. Supports four modes:
 
     1. User-specified splits: If gpu_split_double and gpu_split_single are provided,
-       uses those exact distributions.
+       uses those exact distributions (ignores split_strategy).
 
-    2. Default deterministic splits: For 2, 4, or 8 GPUs, uses pre-defined even splits
-       that balance memory well for B300 GPUs.
+    2. Contiguous (default): Pins all 8 double blocks to GPU 0, then finds optimal
+       split point for single blocks to minimize GPU imbalance. Guarantees exactly
+       2 cross-GPU transfers. Best for 2xB200/B300 setups. Falls back to greedy for >2 GPUs.
 
-    3. Greedy parameter-based: Falls back to the legacy algorithm that assigns
-       blocks until each GPU reaches its fair share of parameters.
+    3. Deterministic: For 2, 4, or 8 GPUs, uses pre-defined even splits that balance
+       memory well. Falls back to greedy for other GPU counts.
+
+    4. Greedy: Legacy algorithm that assigns blocks until each GPU reaches its fair
+       share of parameters. Can cause 20-30+ cross-GPU transfers per forward pass.
 
     Args:
         transformer: The Flux2 model to split
         gpu_split_double: List of double blocks per GPU, e.g., [4, 4] for 2 GPUs
         gpu_split_single: List of single blocks per GPU, e.g., [24, 24] for 2 GPUs
+        split_strategy: Strategy for distributing blocks. One of:
+            - "contiguous" (default): Optimal for 2 GPUs, minimizes transfers
+            - "deterministic": Even distribution for 2/4/8 GPUs
+            - "greedy": Legacy param-based distribution
         use_stream_transfers: If True, use CUDA stream-based transfers for
             overlapped compute/transfer (recommended for best throughput)
         sync_per_block: If True, synchronize device after each block's transfers.
@@ -805,6 +991,11 @@ def add_model_gpu_splitter_to_flux2(
             backward pass - set this to match where your loss is computed.
         other_module_params: Estimated parameter count for non-transformer modules
         other_module_param_count_scale: Multiplier for other_module_params
+
+    Memory Distribution Example (2x B200 with FLUX.2, contiguous split):
+        GPU 0: Mistral TE + VAE + embedders + 8 double + ~20 single blocks
+        GPU 1: ~28 single blocks
+        Transfers: 2 total (at single split point + return for final_layer)
 
     Memory Distribution Example (2x B300 with FLUX.2, deterministic split):
         GPU 0: Embedders + 4 double + 24 single (~50GB transformer + TE cached)
@@ -842,38 +1033,57 @@ def add_model_gpu_splitter_to_flux2(
     for block in transformer.single_blocks:
         _reset_block(block)
 
-    # Determine split strategy
-    use_deterministic = False
-    double_split = None
-    single_split = None
+    # Validate split_strategy
+    if split_strategy not in ("contiguous", "deterministic", "greedy"):
+        print(f"[GPU Splitter] Warning: Unknown split_strategy '{split_strategy}', using 'contiguous' instead")
+        split_strategy = "contiguous"
 
-    # Priority 1: User-specified splits
+    # Priority 1: User-specified splits (takes precedence over strategy)
     if gpu_split_double is not None and gpu_split_single is not None:
         if len(gpu_split_double) != n_gpus:
             raise ValueError(f"gpu_split_double has {len(gpu_split_double)} elements but {n_gpus} GPUs available")
         if len(gpu_split_single) != n_gpus:
             raise ValueError(f"gpu_split_single has {len(gpu_split_single)} elements but {n_gpus} GPUs available")
-        double_split = gpu_split_double
-        single_split = gpu_split_single
-        use_deterministic = True
         print(f"[GPU Splitter] Using user-specified split configuration")
-
-    # Priority 2: Default deterministic splits for common configurations
-    elif n_gpus in DEFAULT_SPLITS:
-        double_split = DEFAULT_SPLITS[n_gpus]["double"]
-        single_split = DEFAULT_SPLITS[n_gpus]["single"]
-        use_deterministic = True
-        print(f"[GPU Splitter] Using default deterministic split for {n_gpus} GPUs")
-
-    # Apply the appropriate split
-    if use_deterministic:
         _apply_deterministic_split(
-            transformer, gpu_ids, double_split, single_split,
+            transformer, gpu_ids, gpu_split_double, gpu_split_single,
             use_stream_transfers=use_stream_transfers,
             sync_per_block=sync_per_block,
             output_device=output_device,
         )
-    else:
+
+    # Priority 2: Use the selected split_strategy
+    elif split_strategy == "contiguous":
+        # Contiguous is optimal for 2 GPUs, falls back to greedy for >2
+        _apply_contiguous_split(
+            transformer, gpu_ids, other_module_params, other_module_param_count_scale,
+            use_stream_transfers=use_stream_transfers,
+            sync_per_block=sync_per_block,
+            output_device=output_device,
+        )
+
+    elif split_strategy == "deterministic":
+        # Use pre-defined splits for 2/4/8 GPUs, else fall back to greedy
+        if n_gpus in DEFAULT_SPLITS:
+            double_split = DEFAULT_SPLITS[n_gpus]["double"]
+            single_split = DEFAULT_SPLITS[n_gpus]["single"]
+            print(f"[GPU Splitter] Using default deterministic split for {n_gpus} GPUs")
+            _apply_deterministic_split(
+                transformer, gpu_ids, double_split, single_split,
+                use_stream_transfers=use_stream_transfers,
+                sync_per_block=sync_per_block,
+                output_device=output_device,
+            )
+        else:
+            print(f"[GPU Splitter] No deterministic split for {n_gpus} GPUs, falling back to greedy")
+            _apply_greedy_split(
+                transformer, gpu_ids, other_module_params, other_module_param_count_scale,
+                use_stream_transfers=use_stream_transfers,
+                sync_per_block=sync_per_block,
+                output_device=output_device,
+            )
+
+    else:  # greedy
         _apply_greedy_split(
             transformer, gpu_ids, other_module_params, other_module_param_count_scale,
             use_stream_transfers=use_stream_transfers,

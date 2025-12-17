@@ -156,6 +156,7 @@ class Flux2Model(BaseModel):
                 transformer,
                 gpu_split_double=self.model_config.gpu_split_double,
                 gpu_split_single=self.model_config.gpu_split_single,
+                split_strategy=getattr(self.model_config, 'split_model_strategy', 'contiguous'),
                 use_stream_transfers=self.model_config.use_stream_transfers,
                 sync_per_block=getattr(self.model_config, 'sync_per_block', False),
                 output_device=output_device,

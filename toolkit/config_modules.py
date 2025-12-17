@@ -690,6 +690,9 @@ class ModelConfig:
         self.split_model_over_gpus = kwargs.get("split_model_over_gpus", False)
         # Note: validation for split_model_over_gpus moved to after arch processing (see below)
         self.split_model_other_module_param_count_scale = kwargs.get("split_model_other_module_param_count_scale", 0.3)
+        # Split strategy: "contiguous" (optimal for 2 GPUs, fewer transfers),
+        # "deterministic" (even distribution), or "greedy" (param-balanced but interleaved)
+        self.split_model_strategy: str = kwargs.get("split_model_strategy", "contiguous")
 
         # Explicit GPU split configuration for deterministic block distribution
         # gpu_split_double: list of ints specifying double blocks per GPU, e.g., [4, 4] for 2 GPUs
