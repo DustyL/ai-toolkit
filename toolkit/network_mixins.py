@@ -219,9 +219,18 @@ class ToolkitModuleMixin:
 
             # scaling for rank dropout: treat as if the rank is changed
             # maskから計算することも考えられるが、augmentation的な効果を期待してrank_dropoutを用いる
-            scale = self.scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
+            # Get base scale (dynamic from alpha scheduler or static)
+            if hasattr(self, 'get_current_scale'):
+                base_scale = self.get_current_scale()
+            else:
+                base_scale = self.scale
+            scale = base_scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
         else:
-            scale = self.scale
+            # Get base scale (dynamic from alpha scheduler or static)
+            if hasattr(self, 'get_current_scale'):
+                scale = self.get_current_scale()
+            else:
+                scale = self.scale
 
         lx = self.lora_up(lx)
 

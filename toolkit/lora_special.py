@@ -124,8 +124,13 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
+        self.initial_alpha = alpha  # Store for alpha scheduler reference
         self.scale = alpha / self.lora_dim
         self.register_buffer("alpha", torch.tensor(alpha))  # 定数として扱える
+
+        # Alpha scheduler support
+        self.alpha_scheduler = None  # Set by network if alpha scheduling is enabled
+        self.is_conv = org_module.__class__.__name__ in CONV_MODULES
 
         # same as microsoft's
         torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
@@ -144,6 +149,17 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.org_forward = self.org_module[0].forward
         self.org_module[0].forward = self.forward
         # del self.org_module
+
+    def get_current_alpha(self) -> float:
+        """Get current alpha value, either from scheduler or initial value."""
+        if self.alpha_scheduler is None:
+            return self.initial_alpha
+        return self.alpha_scheduler.get_current_alpha(self.lora_name, self.is_conv)
+
+    def get_current_scale(self) -> float:
+        """Get current scale value (alpha/rank) for forward pass."""
+        current_alpha = self.get_current_alpha()
+        return current_alpha / self.lora_dim
 
 
 class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
@@ -584,6 +600,19 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         for lora in self.text_encoder_loras + self.unet_loras:
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
+
+        # Initialize alpha scheduler if configured
+        self.alpha_scheduler = None
+        if self.network_config and hasattr(self.network_config, 'alpha_schedule') and self.network_config.alpha_schedule:
+            alpha_cfg = self.network_config.alpha_schedule
+            if alpha_cfg.enabled:
+                from .alpha_scheduler import PhaseAlphaScheduler
+                scheduler_config = alpha_cfg.to_scheduler_config(self.lora_dim)
+                self.alpha_scheduler = PhaseAlphaScheduler(scheduler_config, self.lora_dim)
+                # Assign scheduler reference to all LoRA modules
+                for lora in self.text_encoder_loras + self.unet_loras:
+                    lora.alpha_scheduler = self.alpha_scheduler
+                print(f"Alpha scheduler enabled with {len(alpha_cfg.conv_alpha_phases)} phases")
 
         if self.full_train_in_out:
             print("full train in out")

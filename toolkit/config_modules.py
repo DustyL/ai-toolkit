@@ -162,6 +162,99 @@ class LoRMConfig:
 NetworkType = Literal['lora', 'locon', 'lorm', 'lokr', 'loha', 'dora', 'boft', 'diag-oft']
 
 
+class AlphaSchedulePhaseConfig:
+    """Configuration for a single alpha scheduling phase."""
+    def __init__(self, name: str, **kwargs):
+        self.name = name
+        self.alpha: float = kwargs.get('alpha', 8)
+        self.min_steps: int = kwargs.get('min_steps', 500)
+
+        # Exit criteria (when to transition to next phase)
+        exit_criteria = kwargs.get('exit_criteria', {})
+        self.loss_improvement_rate_below: float = exit_criteria.get('loss_improvement_rate_below', 0.005)
+        self.min_gradient_stability: float = exit_criteria.get('min_gradient_stability', 0.50)
+        self.min_loss_r2: float = exit_criteria.get('min_loss_r2', 0.01)
+
+
+class AlphaScheduleExpertConfig:
+    """Per-expert alpha scheduling configuration for MoE models."""
+    def __init__(self, **kwargs):
+        self.lr_multiplier: float = kwargs.get('lr_multiplier', 1.0)
+        phases_dict = kwargs.get('phases', {})
+        self.phases: Dict[str, AlphaSchedulePhaseConfig] = {
+            name: AlphaSchedulePhaseConfig(name, **config)
+            for name, config in phases_dict.items()
+        }
+
+
+class AlphaScheduleConfig:
+    """
+    Configuration for progressive alpha scheduling in LoRA training.
+
+    Alpha scheduling progressively increases the LoRA alpha value through
+    training phases (foundation → balance → emphasis) based on training
+    metrics like loss plateau and gradient stability.
+    """
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.linear_alpha: float = kwargs.get('linear_alpha', 16)
+
+        # Parse conv_alpha_phases into phase configs
+        conv_phases = kwargs.get('conv_alpha_phases', {})
+        self.conv_alpha_phases: Dict[str, AlphaSchedulePhaseConfig] = {}
+
+        # Default phase order
+        phase_order = ['foundation', 'balance', 'emphasis']
+        for phase_name in phase_order:
+            if phase_name in conv_phases:
+                self.conv_alpha_phases[phase_name] = AlphaSchedulePhaseConfig(
+                    phase_name, **conv_phases[phase_name]
+                )
+
+        # Per-expert configurations for MoE models (e.g., WAN2.2 high_noise/low_noise)
+        per_expert = kwargs.get('per_expert', {})
+        self.per_expert: Dict[str, AlphaScheduleExpertConfig] = {
+            expert_name: AlphaScheduleExpertConfig(**expert_config)
+            for expert_name, expert_config in per_expert.items()
+        }
+
+    def to_scheduler_config(self, rank: int) -> dict:
+        """
+        Convert to the dict format expected by PhaseAlphaScheduler.
+
+        Args:
+            rank: The network rank, needed for scale calculations
+
+        Returns:
+            Configuration dict for PhaseAlphaScheduler
+        """
+        config = {
+            'enabled': self.enabled,
+            'linear_alpha': self.linear_alpha,
+            'conv_alpha_phases': {},
+            'per_expert': {}
+        }
+
+        for phase_name, phase in self.conv_alpha_phases.items():
+            config['conv_alpha_phases'][phase_name] = {
+                'alpha': phase.alpha,
+                'min_steps': phase.min_steps,
+                'exit_criteria': {
+                    'loss_improvement_rate_below': phase.loss_improvement_rate_below,
+                    'min_gradient_stability': phase.min_gradient_stability,
+                    'min_loss_r2': phase.min_loss_r2,
+                }
+            }
+
+        for expert_name, expert in self.per_expert.items():
+            expert_config = {'lr_multiplier': expert.lr_multiplier, 'phases': {}}
+            for phase_name, phase in expert.phases.items():
+                expert_config['phases'][phase_name] = {'alpha': phase.alpha}
+            config['per_expert'][expert_name] = expert_config
+
+        return config
+
+
 class NetworkConfig:
     def __init__(self, **kwargs):
         self.type: NetworkType = kwargs.get('type', 'lora')
@@ -235,6 +328,13 @@ class NetworkConfig:
         
         # for multi stage models
         self.split_multistage_loras = kwargs.get('split_multistage_loras', True)
+
+        # Alpha scheduling for progressive LoRA training
+        # Automatically increases alpha through phases based on training metrics
+        alpha_schedule = kwargs.get('alpha_schedule', None)
+        self.alpha_schedule: Optional[AlphaScheduleConfig] = None
+        if alpha_schedule is not None:
+            self.alpha_schedule = AlphaScheduleConfig(**alpha_schedule)
 
         # layer offloading for network (LoRA/LoHA/etc)
         self.layer_offloading = kwargs.get('layer_offloading', False)

@@ -431,6 +431,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             'step': self.step_num,
             'epoch': self.epoch_num,
         })
+        # Include alpha scheduler state if enabled
+        if (self.network is not None and
+            hasattr(self.network, 'alpha_scheduler') and
+            self.network.alpha_scheduler is not None):
+            info['alpha_scheduler_state'] = self.network.alpha_scheduler.state_dict()
         return info
 
     def clean_up_saves(self):
@@ -1052,6 +1057,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.epoch_num = meta['training_info']['epoch']
             self.start_step = self.step_num
             print_acc(f"Found step {self.step_num} in metadata, starting from there")
+
+            # Restore alpha scheduler state if available
+            if 'alpha_scheduler_state' in meta['training_info']:
+                if (self.network is not None and
+                    hasattr(self.network, 'alpha_scheduler') and
+                    self.network.alpha_scheduler is not None):
+                    self.network.alpha_scheduler.load_state_dict(meta['training_info']['alpha_scheduler_state'])
+                    print_acc(f"Restored alpha scheduler state from checkpoint")
 
     def load_weights(self, path):
         if self.network is not None:
@@ -2579,6 +2592,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     f'loss/{key}': value,
                                 })
 
+                    # Log alpha scheduler metrics if enabled
+                    if (self.is_main_process and
+                        self.network is not None and
+                        hasattr(self.network, 'alpha_scheduler') and
+                        self.network.alpha_scheduler is not None):
+                        scheduler_status = self.network.alpha_scheduler.get_status()
+                        if scheduler_status.get('enabled', False):
+                            self.logger.log({
+                                'alpha_scheduler/phase': scheduler_status.get('current_phase', 'unknown'),
+                                'alpha_scheduler/conv_alpha': scheduler_status.get('current_conv_alpha', 0),
+                                'alpha_scheduler/conv_scale': scheduler_status.get('current_conv_scale', 0),
+                                'alpha_scheduler/steps_in_phase': scheduler_status.get('steps_in_phase', 0),
+                            })
+                            if self.writer is not None:
+                                self.writer.add_scalar('alpha_scheduler/conv_alpha', scheduler_status.get('current_conv_alpha', 0), self.step_num)
+                                self.writer.add_scalar('alpha_scheduler/conv_scale', scheduler_status.get('current_conv_scale', 0), self.step_num)
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
                         if self.progress_bar is not None:
@@ -2604,6 +2633,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # update various steps
                 self.step_num = step + 1
                 self.grad_accumulation_step += 1
+
+                # Update alpha scheduler if enabled
+                if (self.network is not None and
+                    hasattr(self.network, 'alpha_scheduler') and
+                    self.network.alpha_scheduler is not None and
+                    loss_dict is not None):
+                    # Get the main loss value (first key or 'loss' if available)
+                    loss_value = None
+                    if 'loss' in loss_dict:
+                        loss_value = loss_dict['loss']
+                    elif len(loss_dict) > 0:
+                        loss_value = list(loss_dict.values())[0]
+
+                    if loss_value is not None:
+                        self.network.alpha_scheduler.update(
+                            step=self.step_num,
+                            loss=float(loss_value)
+                        )
+
                 self.end_step_hook()
 
 
