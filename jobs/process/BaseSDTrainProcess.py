@@ -1058,13 +1058,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.start_step = self.step_num
             print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
-            # Restore alpha scheduler state if available
-            if 'alpha_scheduler_state' in meta['training_info']:
-                if (self.network is not None and
-                    hasattr(self.network, 'alpha_scheduler') and
-                    self.network.alpha_scheduler is not None):
-                    self.network.alpha_scheduler.load_state_dict(meta['training_info']['alpha_scheduler_state'])
-                    print_acc(f"Restored alpha scheduler state from checkpoint")
+        # Restore alpha scheduler state regardless of start_step override
+        # This ensures phase progression is maintained even when resuming from a specific step
+        if meta is not None and 'training_info' in meta and 'alpha_scheduler_state' in meta['training_info']:
+            if (self.network is not None and
+                hasattr(self.network, 'alpha_scheduler') and
+                self.network.alpha_scheduler is not None):
+                self.network.alpha_scheduler.load_state_dict(meta['training_info']['alpha_scheduler_state'])
+                print_acc(f"Restored alpha scheduler state from checkpoint")
 
     def load_weights(self, path):
         if self.network is not None:

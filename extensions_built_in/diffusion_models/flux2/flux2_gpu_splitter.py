@@ -529,7 +529,7 @@ def new_device_to_flux2(self: "Flux2", *args, **kwargs):
     self.final_layer = to_with_optional_device(self.final_layer, device)
 
     # Update _split_output_device to match where final_layer now lives
-    if has_device and device is not None:
+    if has_device and device is not None and len(self.single_blocks) > 0:
         last_block = self.single_blocks[-1]
         if moving_to_cpu:
             if not hasattr(last_block, "_original_split_output_device"):
@@ -657,8 +657,9 @@ def _apply_deterministic_split(
 
     # Set last single block to route output to output_device
     # This ensures the final tensor ends up on the correct device for loss computation
-    transformer.single_blocks[-1]._split_output_device = output_device
-    _log_debug(f"Last block output device set to {output_device}")
+    if len(transformer.single_blocks) > 0:
+        transformer.single_blocks[-1]._split_output_device = output_device
+        _log_debug(f"Last block output device set to {output_device}")
 
     # Log distribution
     print("[GPU Splitter] Block distribution:")
@@ -751,8 +752,9 @@ def _apply_greedy_split(
 
     # Set last single block to route output to output_device
     # This ensures the final tensor ends up on the correct device for loss computation
-    transformer.single_blocks[-1]._split_output_device = output_device
-    _log_debug(f"Last block output device set to {output_device}")
+    if len(transformer.single_blocks) > 0:
+        transformer.single_blocks[-1]._split_output_device = output_device
+        _log_debug(f"Last block output device set to {output_device}")
 
     # Log distribution
     print("[GPU Splitter] Block distribution:")
@@ -910,8 +912,9 @@ def _apply_contiguous_split(
         gpu_param_totals[gpu_ids[current_gpu_idx]] += single_params_list[i]
 
     # Set last single block to route output to output_device
-    transformer.single_blocks[-1]._split_output_device = output_device
-    _log_debug(f"Last block output device set to {output_device}")
+    if len(transformer.single_blocks) > 0:
+        transformer.single_blocks[-1]._split_output_device = output_device
+        _log_debug(f"Last block output device set to {output_device}")
 
     # Log split details with percentage
     num_singles = len(transformer.single_blocks)
