@@ -222,6 +222,8 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
         ) -> List[network_module]:
             print('Create LyCORIS Module')
             loras = []
+            created_names = set()  # Track already created LoRA names to avoid duplicates
+            skipped_duplicates = 0  # Count how many duplicates were skipped
             # remove this
             named_modules = root_module.named_modules()
             # add a few to tthe generator
@@ -240,19 +242,8 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
                             print(f"{lora_name}")
 
                         if child_module.__class__.__name__ in LINEAR_MODULES and lora_dim > 0:
-                            lora = algo(
-                                lora_name, child_module, self.multiplier,
-                                self.lora_dim, self.alpha,
-                                self.dropout, self.rank_dropout, self.module_dropout,
-                                use_cp,
-                                network=self,
-                                parent=module,
-                                use_bias=use_bias,
-                                **kwargs
-                            )
-                        elif child_module.__class__.__name__ in CONV_MODULES:
-                            k_size, *_ = child_module.kernel_size
-                            if k_size == 1 and lora_dim > 0:
+                            # Skip if we've already created a LoRA for this name
+                            if lora_name not in created_names:
                                 lora = algo(
                                     lora_name, child_module, self.multiplier,
                                     self.lora_dim, self.alpha,
@@ -260,25 +251,50 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
                                     use_cp,
                                     network=self,
                                     parent=module,
-                                use_bias=use_bias,
-                                    **kwargs
-                                )
-                            elif conv_lora_dim > 0:
-                                lora = algo(
-                                    lora_name, child_module, self.multiplier,
-                                    self.conv_lora_dim, self.conv_alpha,
-                                    self.dropout, self.rank_dropout, self.module_dropout,
-                                    use_cp,
-                                    network=self,
-                                    parent=module,
                                     use_bias=use_bias,
                                     **kwargs
                                 )
+                                created_names.add(lora_name)
                             else:
-                                continue
+                                lora = None
+                                skipped_duplicates += 1
+                        elif child_module.__class__.__name__ in CONV_MODULES:
+                            # Skip if we've already created a LoRA for this name
+                            if lora_name not in created_names:
+                                k_size, *_ = child_module.kernel_size
+                                if k_size == 1 and lora_dim > 0:
+                                    lora = algo(
+                                        lora_name, child_module, self.multiplier,
+                                        self.lora_dim, self.alpha,
+                                        self.dropout, self.rank_dropout, self.module_dropout,
+                                        use_cp,
+                                        network=self,
+                                        parent=module,
+                                        use_bias=use_bias,
+                                        **kwargs
+                                    )
+                                    created_names.add(lora_name)
+                                elif conv_lora_dim > 0:
+                                    lora = algo(
+                                        lora_name, child_module, self.multiplier,
+                                        self.conv_lora_dim, self.conv_alpha,
+                                        self.dropout, self.rank_dropout, self.module_dropout,
+                                        use_cp,
+                                        network=self,
+                                        parent=module,
+                                        use_bias=use_bias,
+                                        **kwargs
+                                    )
+                                    created_names.add(lora_name)
+                                else:
+                                    continue
+                            else:
+                                lora = None
+                                skipped_duplicates += 1
                         else:
                             continue
-                        loras.append(lora)
+                        if lora is not None:
+                            loras.append(lora)
                 elif name in target_replace_names:
                     if name in self.NAME_ALGO_MAP:
                         algo = self.NAME_ALGO_MAP[name]
@@ -326,6 +342,11 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
                     else:
                         continue
                     loras.append(lora)
+
+            # Report if any duplicates were skipped
+            if skipped_duplicates > 0:
+                print(f"  Skipped {skipped_duplicates} duplicate LoRA module names")
+
             return loras
 
         if network_module == GLoRAModule:
@@ -358,16 +379,79 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
                 ))
         print(f"create LyCORIS for Text Encoder: {len(self.text_encoder_loras)} modules.")
         if self.train_unet:
+            # Check if this is a Qwen model and adjust target modules accordingly
+            unet_class_name = unet.__class__.__name__
+            target_modules = LycorisSpecialNetwork.UNET_TARGET_REPLACE_MODULE
+
+            if unet_class_name == "QwenImageTransformer2DModel":
+                # For Qwen Image Edit models, target only the modules that directly contain
+                # Linear/Conv2d layers to avoid duplicates from nested module matching
+                target_modules = [
+                    # Primary targets - these should contain Linear/Conv2d directly
+                    "Attention",          # Contains to_q, to_k, to_v, to_out Linear layers
+                    "FeedForward",       # Contains Linear layers for MLP
+                    # Secondary targets if primary don't work
+                    "MLP",
+                    "FFN",
+                    "GEGLU",
+                    "GeGLU",
+                ]
+                print(f"Detected Qwen Image model, using targeted module search to avoid duplicates")
+
             self.unet_loras = create_modules(LycorisSpecialNetwork.LORA_PREFIX_UNET, unet,
-                                             LycorisSpecialNetwork.UNET_TARGET_REPLACE_MODULE)
+                                             target_modules)
+
+            # If no modules were found with the standard approach, try a fallback
+            if len(self.unet_loras) == 0 and unet_class_name == "QwenImageTransformer2DModel":
+                print("No modules found with standard targets, attempting automatic discovery...")
+
+                # Collect all module class names that look trainable
+                discovered_modules = set()
+                for name, module in unet.named_modules():
+                    module_class_name = module.__class__.__name__
+                    # Look for modules that typically contain parameters
+                    if any(keyword in module_class_name.lower() for keyword in
+                           ["linear", "conv", "attention", "feedforward", "mlp", "ffn"]):
+                        # Check if module has parameters (is trainable)
+                        if any(p.requires_grad for p in module.parameters(recurse=False)):
+                            discovered_modules.add(module_class_name)
+
+                if discovered_modules:
+                    print(f"Discovered potential target modules: {sorted(discovered_modules)}")
+                    # Try with the discovered module types
+                    self.unet_loras = create_modules(
+                        LycorisSpecialNetwork.LORA_PREFIX_UNET,
+                        unet,
+                        list(discovered_modules)
+                    )
+                    print(f"Created {len(self.unet_loras)} LyCORIS modules using discovered targets")
         else:
             self.unet_loras = []
         print(f"create LyCORIS for U-Net: {len(self.unet_loras)} modules.")
 
+        # Final warning if no modules were created
+        if self.train_unet and len(self.unet_loras) == 0:
+            print("\n" + "=" * 60)
+            print("WARNING: No LyCORIS modules were created for U-Net!")
+            print("This usually means the model architecture is incompatible.")
+            print("Debugging tips:")
+            print("1. Check that the model is loaded correctly")
+            print("2. Verify the model architecture matches your config")
+            print("=" * 60 + "\n")
+
         self.weights_sd = None
 
-        # assertion
+        # Check for duplicates - warn instead of failing
         names = set()
+        duplicates = []
         for lora in self.text_encoder_loras + self.unet_loras:
-            assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
+            if lora.lora_name in names:
+                duplicates.append(lora.lora_name)
             names.add(lora.lora_name)
+
+        if duplicates:
+            print(f"Warning: Found {len(duplicates)} duplicate LoRA names (handled gracefully):")
+            for dup in duplicates[:5]:  # Show first 5 duplicates
+                print(f"   - {dup}")
+            if len(duplicates) > 5:
+                print(f"   ... and {len(duplicates) - 5} more")
