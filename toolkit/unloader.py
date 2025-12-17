@@ -47,13 +47,21 @@ def unload_text_encoder(model: "BaseModel"):
             if hasattr(pipe, "text_encoder"):
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
+                # Explicitly move to CPU before replacement to prevent memory leaks
                 pipe.text_encoder.to('cpu')
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()  # Free cached memory blocks
                 pipe.text_encoder = te
 
             i = 2
             while hasattr(pipe, f"text_encoder_{i}"):
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
+                # Explicitly move to CPU before replacement
+                old_te = getattr(pipe, f"text_encoder_{i}")
+                old_te.to('cpu')
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 setattr(pipe, f"text_encoder_{i}", te)
                 i += 1
             model.text_encoder = text_encoder_list
