@@ -1,0 +1,156 @@
+---
+# FLUX.2-dev LoHA Training - Single B300 GPU
+# Launch: python run.py config/flux2-dlay-1gpu-loha.yaml
+# LoHA (Hadamard Product) - excellent for fine-grained details like faces
+# Guide: Good for Category D (realistic humans) with DoRA integration
+
+job: extension
+config:
+  name: "dlay_flux2_loha_1gpu"
+  process:
+    - type: sd_trainer
+      training_folder: "/root/output"
+      performance_log_every: 100
+      device: cuda:0
+
+      # NETWORK CONFIGURATION - LoHA with DoRA integration
+      # LoHA = (A1 × B1) ⊙ (A2 × B2) - element-wise Hadamard product
+      # Particularly effective for faces and fine-grained detail capture
+      network:
+        type: loha
+        linear: 128
+        linear_alpha: 64  # Half of rank for dampening
+        dropout: 0.0
+        # LoHA-specific options
+        use_tucker: false          # Tucker decomposition for conv (not needed for FLUX)
+        use_scalar: true           # Trainable scalar for immediate effect
+        weight_decompose: true     # DoRA-style magnitude/direction separation
+        wd_on_out: true            # Decomposition direction (output dim)
+        rs_lora: true              # Rank-stabilized scaling (sqrt)
+        rank_dropout_scale: false  # Scale dropout by mean
+        network_kwargs:
+          rank_dropout: 0.02
+
+      # MODEL CONFIGURATION - B300 with layer offloading for DOP headroom
+      model:
+        name_or_path: "black-forest-labs/FLUX.2-dev"
+        arch: flux2
+        quantize: false
+        quantize_te: false
+        low_vram: false
+        layer_offloading: true
+        layer_offloading_transformer_percent: 0.25
+
+      # DATASET CONFIGURATION - Optimized captions
+      datasets:
+        - folder_path: "/root/DATASETS/DLAY/flux2"
+          caption_ext: "txt"
+          default_caption: "DLAY man"
+
+          # Focus Mask - white regions are subject
+          mask_path: "/root/DATASETS/DLAY/mask"
+          mask_min_value: 0.0
+          invert_mask: false
+          loss_multiplier: 1.2
+
+          # Multi-resolution training
+          resolution: [512, 768, 1024]
+
+          # Caching
+          cache_latents: true
+          cache_latents_to_disk: true
+
+          caption_dropout_rate: 0.05
+          shuffle_tokens: true
+
+      # TRAINING CONFIGURATION
+      train:
+        batch_size: 1  # Conservative for single B300
+        gradient_accumulation: 1
+        steps: 6000
+
+        # Prodigy optimizer with guide-recommended settings
+        optimizer: prodigy
+        lr: 1.0
+        optimizer_params:
+          d_coef: 1.5  # Guide: 1.5-2.0 for characters
+          use_bias_correction: true
+          weight_decay: 0.01
+          safeguard_warmup: true
+          # Prodigy expects betas as a tuple of floats (not a string)
+          betas: [0.9, 0.999]
+
+        lr_scheduler: cosine_with_warmup
+        lr_scheduler_params:
+          num_warmup_steps: 300
+          num_training_steps: 6000
+
+        dtype: bf16
+        attention_backend: flash
+        gradient_checkpointing: false
+
+        noise_scheduler: flowmatch
+        timestep_type: weighted
+        max_grad_norm: 1.0
+
+        # SNR weighting - aggressive value for character training (1-3)
+        min_snr_gamma: null
+
+        ema_config:
+          use_ema: false
+          ema_decay: 0.9995
+
+        train_unet: true
+        train_text_encoder: false
+        skip_first_sample: true
+        cache_text_embeddings: false
+
+        # Differential output preservation
+        diff_output_preservation: false
+        diff_output_preservation_multiplier: 1.0
+        diff_output_preservation_class: "man"
+
+      save:
+        dtype: bfloat16
+        save_every: 500
+        save_format: safetensors
+        max_step_saves_to_keep: 10
+
+      sample:
+        sampler: flowmatch
+        sample_every: 500
+        width: 1024
+        height: 1024
+        prompts:
+          - "DLAY man, portrait, neutral background, studio lighting"
+          - "DLAY man, corporate headshot, navy suit, professional lighting"
+          - "DLAY man, cinematic close-up, dramatic side lighting"
+          - "DLAY man, casual t-shirt, outdoor park, natural daylight"
+          - "DLAY man, full body, forest setting, dappled light"
+          - "DLAY man, holding coffee, cafe interior, warm ambient lighting"
+          - "DLAY man, beach at sunset, golden hour"
+          - "DLAY man, at desk with laptop, home office, warm lighting"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4.0
+        sample_steps: 28
+
+      logging:
+        log_every: 10
+        use_wandb: true
+        wandb_project: "flux2-dlay-b300"
+        wandb_run_name: "dlay-flux2-loha-1gpu"
+
+meta:
+  name: DLAY_flux2_loha_1gpu
+  version: '4.0'
+  description: "FLUX.2 Persona LoHA - Single B300, DoRA integration, excellent for faces"
+  trigger_words:
+    - DLAY
+  tags:
+    - portrait
+    - persona
+    - flux2
+    - loha
+    - single-gpu

@@ -22,9 +22,10 @@ if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork, LoRAModule
     from toolkit.stable_diffusion_model import StableDiffusion
     from toolkit.models.DoRA import DoRAModule
+    from toolkit.models.loha import LohaModule
 
 Network = Union['LycorisSpecialNetwork', 'LoRASpecialNetwork']
-Module = Union['LoConSpecialModule', 'LoRAModule', 'DoRAModule']
+Module = Union['LoConSpecialModule', 'LoRAModule', 'DoRAModule', 'LohaModule']
 
 LINEAR_MODULES = [
     'Linear',
@@ -291,6 +292,9 @@ class ToolkitModuleMixin:
         #     return self.dora_forward(x, *args, **kwargs)
         
         if self.__class__.__name__ == "LokrModule":
+            return self._call_forward(x)
+
+        if self.__class__.__name__ == "LohaModule":
             return self._call_forward(x)
 
         org_forwarded = self.org_forward(x, *args, **kwargs)
@@ -755,6 +759,12 @@ class ToolkitNetworkMixin:
             dtype = first_module.lokr_w1_a.dtype
             if hasattr(first_module.lokr_w1_a, '_memory_management_device'):
                 device = first_module.lokr_w1_a._memory_management_device
+        elif hasattr(first_module, 'hada_w1_a'):
+            # LoHA module uses Hadamard product decomposition (hada_w1_a, hada_w1_b, hada_w2_a, hada_w2_b)
+            device = first_module.hada_w1_a.device
+            dtype = first_module.hada_w1_a.dtype
+            if hasattr(first_module.hada_w1_a, '_memory_management_device'):
+                device = first_module.hada_w1_a._memory_management_device
         else:
             raise ValueError("Unknown module type")
         with torch.no_grad():

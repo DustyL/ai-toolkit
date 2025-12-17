@@ -1816,10 +1816,12 @@ class TextEmbeddingFileItemDTOMixin:
     def get_text_embedding_info_dict(self: 'FileItemDTO'):
         # make sure the caption is loaded here
         # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
-        if self.caption is None:
+        if self.raw_caption is None:
             self.load_caption()
+        # Use raw_caption for hash stability - processed caption (shuffle_tokens, dropout)
+        # changes each run, but we want consistent cache keys based on the original caption
         item = OrderedDict([
-            ("caption", self.caption),
+            ("caption", self.raw_caption if self.raw_caption else ''),
             ("text_embedding_space_version", self.text_embedding_space_version),
             ("text_embedding_version", self.text_embedding_version),
         ])
@@ -1842,6 +1844,15 @@ class TextEmbeddingFileItemDTOMixin:
             hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
             hash_str = hash_str.replace('=', '')
             self._text_embedding_path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+            # If recalculate is False and the exact hash file is missing, accept any prefix match
+            if not recalculate and not os.path.exists(self._text_embedding_path):
+                import glob
+                candidates = glob.glob(os.path.join(te_dir, f"{filename_no_ext}_*.safetensors"))
+                if len(candidates) > 0:
+                    candidates.sort(key=os.path.getmtime, reverse=True)
+                    self._text_embedding_path = candidates[0]
+                    self.is_text_embedding_cached = True
+                    print_acc(f"[TE CACHE] Fallback (get_text_embedding_path) matched {filename_no_ext} -> {self._text_embedding_path}")
 
         return self._text_embedding_path
 
@@ -1856,6 +1867,7 @@ class TextEmbeddingFileItemDTOMixin:
         if self.prompt_embeds is None:
             # load it from disk
             self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+            print_acc(f"[TE CACHE] Loaded prompt embedding from {self.get_text_embedding_path()}")
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -1865,63 +1877,81 @@ class TextEmbeddingCachingMixin:
         self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
 
     def cache_text_embeddings(self: 'AiToolkitDataset'):
+        import os
+        batch_size = max(1, int(os.environ.get("AITK_TE_CACHE_BATCH", "1")))
+
+        def process_single(fi: 'FileItemDTO'):
+            text_embedding_path = fi.get_text_embedding_path(recalculate=True)
+            if os.path.exists(text_embedding_path):
+                fi.is_text_embedding_cached = True
+                return
+            if fi.encode_control_in_text_embeddings:
+                if fi.control_path is None:
+                    raise Exception(f"Could not find a control image for {fi.path} which is needed for this model")
+                ctrl_img_list = []
+                control_path_list = fi.control_path
+                if not isinstance(fi.control_path, list):
+                    control_path_list = [control_path_list]
+                for cpath in control_path_list:
+                    try:
+                        img = Image.open(cpath).convert("RGB")
+                        img = exif_transpose(img)
+                        img = (
+                            TF.to_tensor(img)
+                            .unsqueeze(0)
+                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                        )
+                        ctrl_img_list.append(img)
+                    except Exception as e:
+                        print_acc(f"Error: {e}")
+                        print_acc(f"Error loading control image: {cpath}")
+                if len(ctrl_img_list) == 0:
+                    ctrl_img = None
+                elif not self.sd.has_multiple_control_images:
+                    ctrl_img = ctrl_img_list[0]
+                else:
+                    ctrl_img = ctrl_img_list
+                # Use raw_caption for caching to match hash calculation
+                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(fi.raw_caption, control_images=ctrl_img)
+            else:
+                # Use raw_caption for caching to match hash calculation
+                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(fi.raw_caption)
+            prompt_embeds.save(text_embedding_path)
+            del prompt_embeds
+            fi.is_text_embedding_cached = True
+
+        def process_batch(batch_items: List['FileItemDTO']):
+            # Process items one at a time - batching text encoder doesn't provide
+            # significant speedup and complicates splitting the result
+            for x in batch_items:
+                process_single(x)
+
         with accelerator.main_process_first():
-            print_acc(f"Caching text_embeddings for {self.dataset_path}")
+            print_acc(f"Caching text_embeddings for {self.dataset_path} (batch={batch_size})")
             print_acc(" - Saving text embeddings to disk")
-            
+
             did_move = False
 
-            # use tqdm to show progress
-            i = 0
-            for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
-                file_item.text_embedding_space_version = self.sd.model_config.arch
-                file_item.latent_load_device = self.sd.device
+            batch_buf: List['FileItemDTO'] = []
 
-                text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
-                # only process if not saved to disk
-                if not os.path.exists(text_embedding_path):
-                    # load if not loaded
-                    if not did_move:
-                        self.sd.set_device_state_preset('cache_text_encoder')
-                        did_move = True
-                        
-                    if file_item.encode_control_in_text_embeddings:
-                        if file_item.control_path is None:
-                            raise Exception(f"Could not find a control image for {file_item.path} which is needed for this model")
-                        ctrl_img_list = []
-                        control_path_list = file_item.control_path
-                        if not isinstance(file_item.control_path, list):
-                            control_path_list = [control_path_list]
-                        for i in range(len(control_path_list)):
-                            try:
-                                img = Image.open(control_path_list[i]).convert("RGB")
-                                img = exif_transpose(img)
-                                # convert to 0 to 1 tensor
-                                img = (
-                                    TF.to_tensor(img)
-                                    .unsqueeze(0)
-                                    .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                                )
-                                ctrl_img_list.append(img)
-                            except Exception as e:
-                                print_acc(f"Error: {e}")
-                                print_acc(f"Error loading control image: {control_path_list[i]}")
-                        
-                        if len(ctrl_img_list) == 0:
-                            ctrl_img = None
-                        elif not self.sd.has_multiple_control_images:
-                            ctrl_img = ctrl_img_list[0]
-                        else:
-                            ctrl_img = ctrl_img_list
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
-                    else:
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
-                    # save it
-                    prompt_embeds.save(text_embedding_path)
-                    del prompt_embeds
-                file_item.is_text_embedding_cached = True
-                i += 1
-            # restore device state
+            for fi in tqdm(self.file_list, desc='Caching text embeddings to disk'):
+                fi.text_embedding_space_version = self.sd.model_config.arch
+                fi.latent_load_device = self.sd.device
+
+                # load TE to cache_text_encoder preset once
+                if not did_move:
+                    self.sd.set_device_state_preset('cache_text_encoder')
+                    did_move = True
+
+                batch_buf.append(fi)
+                if len(batch_buf) >= batch_size:
+                    process_batch(batch_buf)
+                    batch_buf = []
+
+            # flush remainder
+            if len(batch_buf) > 0:
+                process_batch(batch_buf)
+
             if did_move:
                 self.sd.restore_device_state()
 

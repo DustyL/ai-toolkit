@@ -321,12 +321,24 @@ class Flux2Pipeline(DiffusionPipeline):
                     img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
 
                 # Ensure all inputs live on the same device/dtype as the transformer
-                model_device = next(self.transformer.parameters()).device
-                model_dtype = next(self.transformer.parameters()).dtype
+                # We need to handle MemoryManager offloading where weight.device is CPU but compute is GPU
+                try:
+                    # Check if time_in layer is managed
+                    time_in_layer = self.transformer.time_in.in_layer
+                    if hasattr(time_in_layer, "_memory_management_device"):
+                        model_device = time_in_layer._memory_management_device
+                    else:
+                        model_device = time_in_layer.weight.device
+                    model_dtype = time_in_layer.weight.dtype
+                except AttributeError:
+                    # Fallback for unmanaged or different structure
+                    first_param = next(self.transformer.parameters())
+                    model_device = first_param.device
+                    model_dtype = first_param.dtype
 
                 img_input = img_input.to(model_device, dtype=model_dtype)
                 img_input_ids = img_input_ids.to(model_device)
-                t_vec = t_vec.to(model_device)
+                t_vec = t_vec.to(model_device, dtype=model_dtype)
                 txt = txt.to(model_device, dtype=model_dtype)
                 txt_ids = txt_ids.to(model_device)
                 guidance_vec = guidance_vec.to(model_device, dtype=model_dtype)

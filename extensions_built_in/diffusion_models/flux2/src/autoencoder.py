@@ -298,6 +298,18 @@ class AutoEncoder(nn.Module):
     def __init__(self, params: AutoEncoderParams):
         super().__init__()
         self.params = params
+        # COMPATIBILITY SHIM: Mock config dict for base_model.py methods
+        # that expect HuggingFace-style VAE config (e.g., decode_latents, get_latent_noise).
+        # NOTE: Flux2's VAE uses internal BatchNorm normalization (normalize/inv_normalize)
+        # instead of external scaling factors. These values are set to neutral (1.0, 0.0)
+        # so the base methods pass through without modification. The actual scaling
+        # is handled by the VAE's encode/decode methods internally.
+        self.config = {
+            'block_out_channels': params.ch_mult,  # [1, 2, 4, 4] -> len-1=3 -> 2^3=8x downscale
+            'scaling_factor': 1.0,  # Neutral - real scaling in normalize()
+            'shift_factor': 0.0,    # Neutral - real shift in normalize()
+            'latent_channels': params.z_channels * 4,  # 32*4=128 post-pixel-shuffle
+        }
         self.encoder = Encoder(
             resolution=params.resolution,
             in_channels=params.in_channels,

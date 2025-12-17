@@ -37,6 +37,7 @@ from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtracto
 from toolkit.util.losses import wavelet_loss, stepped_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
+from toolkit.memory_management import MemoryManager
 from PIL import Image
 from torchvision.transforms import functional as TF
 
@@ -2070,6 +2071,17 @@ class SDTrainer(BaseSDTrainProcess):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
                 else:
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+
+            # Synchronize offloaded layer gradient streams before optimizer step
+            # This ensures all GPU-to-CPU gradient transfers are complete
+            if self.model_config.layer_offloading:
+                if hasattr(self.sd, 'unet') and MemoryManager.is_attached(self.sd.unet):
+                    MemoryManager.synchronize_all(self.sd.unet)
+                if hasattr(self.sd, 'transformer') and MemoryManager.is_attached(self.sd.transformer):
+                    MemoryManager.synchronize_all(self.sd.transformer)
+                if hasattr(self, 'network') and self.network is not None and MemoryManager.is_attached(self.network):
+                    MemoryManager.synchronize_all(self.network)
+
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 # prefer fused step+zero_grad if supported (AdamW_BF16)

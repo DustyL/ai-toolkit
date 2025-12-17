@@ -23,9 +23,17 @@ from .src.model import Flux2, Flux2Params
 from .src.pipeline import Flux2Pipeline
 from .src.autoencoder import AutoEncoder, AutoEncoderParams
 from .flux2_gpu_splitter import add_model_gpu_splitter_to_flux2
+from .src.attention_backends import initialize_attention_for_flux2
 from safetensors.torch import load_file, save_file
 from PIL import Image
 import torch.nn.functional as F
+
+# Import stream manager for multi-GPU transfers
+from .cuda_stream_manager import (
+    DeviceTransferManager,
+    set_transfer_manager,
+    get_transfer_manager,
+)
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -132,8 +140,25 @@ class Flux2Model(BaseModel):
                 self.model_config.quantize = False
 
             self.print_and_status_update("Applying GPU model splitting")
+
+            # POLICY: For training, final output MUST be on self.device_torch (where loss is computed)
+            # User-configured output_device is ignored for training to prevent device mismatches
+            user_output_device = getattr(self.model_config, 'output_device', None)
+            if user_output_device is not None:
+                user_dev = torch.device(user_output_device) if isinstance(user_output_device, str) else user_output_device
+                if user_dev != self.device_torch:
+                    print(f"[Flux2Model] WARNING: Ignoring output_device={user_output_device}. "
+                          f"Training requires output on device_torch={self.device_torch} for loss computation.")
+            # Always use device_torch for training path
+            output_device = self.device_torch
+
             add_model_gpu_splitter_to_flux2(
                 transformer,
+                gpu_split_double=self.model_config.gpu_split_double,
+                gpu_split_single=self.model_config.gpu_split_single,
+                use_stream_transfers=self.model_config.use_stream_transfers,
+                sync_per_block=getattr(self.model_config, 'sync_per_block', False),
+                output_device=output_device,
                 other_module_param_count_scale=self.model_config.split_model_other_module_param_count_scale
             )
 
@@ -158,6 +183,7 @@ class Flux2Model(BaseModel):
                 self.device_torch,
                 offload_percent=self.model_config.layer_offloading_transformer_percent,
             )
+            MemoryManager.log_status(transformer, "transformer")
 
         if self.model_config.low_vram:
             self.print_and_status_update("Moving transformer to CPU")
@@ -190,6 +216,7 @@ class Flux2Model(BaseModel):
                 self.device_torch,
                 offload_percent=self.model_config.layer_offloading_text_encoder_percent,
             )
+            MemoryManager.log_status(text_encoder, "text_encoder")
 
         tokenizer = AutoProcessor.from_pretrained(MISTRAL_PATH, fix_mistral_regex=True)
 
@@ -241,8 +268,41 @@ class Flux2Model(BaseModel):
         text_encoder[0].to(self.device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
-        pipe.transformer = pipe.transformer.to(self.device_torch)
+
+        # CRITICAL: Skip global .to() when split_model_over_gpus is enabled
+        # The GPU splitter has already placed blocks on their target devices via _split_device.
+        # A global .to(device_torch) would collapse all blocks back to a single device,
+        # undoing the split and causing attention contexts to be created on wrong devices.
+        if not self.model_config.split_model_over_gpus:
+            pipe.transformer = pipe.transformer.to(self.device_torch)
         flush()
+
+        # Initialize attention backend contexts for all transformer blocks
+        # TIMING: Must be AFTER GPU splitter (if enabled) so _split_device is set
+        # This configures CuTE/Flash/SDPA per-block based on device capabilities
+        # NOTE: For split_model_over_gpus, contexts use _split_device; otherwise parameter device
+        # NOTE: strict_device_check=True for split mode catches stale contexts after .to() moves
+        #
+        # AUTOCAST HEURISTIC: If model dtype is fp32 but device supports bf16, use bf16
+        # for backend selection. This allows CuTE/Flash to be selected when users train
+        # with dtype=fp32 + autocast(bf16). Runtime guards still fall back to SDPA for
+        # actual fp32 tensors (when autocast is disabled).
+        backend_selection_dtype = dtype
+        if dtype == torch.float32 and torch.cuda.is_bf16_supported():
+            backend_selection_dtype = torch.bfloat16
+            self.print_and_status_update(
+                "Attention backend: using bf16 for selection (fp32 model + bf16-capable GPU). "
+                "CuTE/Flash will be used under autocast; fp32 tensors fall back to SDPA."
+            )
+
+        initialize_attention_for_flux2(
+            transformer=pipe.transformer,
+            requested_backend=self.model_config.attention_backend,
+            dtype=backend_selection_dtype,
+            head_dim=128,  # Flux.2-dev uses 128 head_dim (6144 / 48 heads)
+            cute_min_seqlen=self.model_config.cute_min_seqlen,
+            strict_device_check=self.model_config.split_model_over_gpus,  # Fail-fast for split mode
+        )
 
         # save it to the model class
         self.vae = vae
@@ -314,6 +374,53 @@ class Flux2Model(BaseModel):
         ).images[0]
         return img
 
+    def _setup_transfer_manager(self) -> Optional[DeviceTransferManager]:
+        """
+        Set up or reuse the DeviceTransferManager for multi-GPU stream-based transfers.
+
+        Returns:
+            DeviceTransferManager if stream transfers are enabled and model is split,
+            None otherwise.
+
+        Note:
+            For training, output_device is ALWAYS self.device_torch to ensure
+            the final tensor is on the correct device for loss computation.
+
+        Reuse:
+            The manager is cached on the model instance and reused across training
+            steps. CUDA streams/events are allocated once. Per-step state is reset
+            in the manager's __enter__ method.
+        """
+        transformer = self.transformer
+
+        # Check if model is split and stream transfers are enabled
+        if not hasattr(transformer, '_use_stream_transfers'):
+            return None
+        if not transformer._use_stream_transfers:
+            return None
+        if not hasattr(transformer, '_split_devices'):
+            return None
+
+        # Reuse existing manager if available
+        if hasattr(self, '_transfer_manager') and self._transfer_manager is not None:
+            return self._transfer_manager
+
+        # POLICY: Always use device_torch for training (loss computation device)
+        # This matches the enforcement in load_model()
+        output_device = self.device_torch
+
+        # Create and configure the manager (will be reused across steps)
+        mgr = DeviceTransferManager(
+            devices=transformer._split_devices,
+            enable_timing=False,  # Disable timing for production
+            sync_on_exit=False,   # We handle sync via _join_default_stream
+            output_device=output_device,
+        )
+
+        # Cache for reuse
+        self._transfer_manager = mgr
+        return mgr
+
     def get_noise_prediction(
         self,
         latent_model_input: torch.Tensor,
@@ -323,6 +430,23 @@ class Flux2Model(BaseModel):
         batch: "DataLoaderBatchDTO" = None,
         **kwargs,
     ):
+        """
+        Get noise prediction from the transformer.
+
+        For multi-GPU setups with split_model_over_gpus=True and use_stream_transfers=True,
+        this method sets up a DeviceTransferManager to handle efficient tensor transfers
+        between GPUs with proper synchronization for the backward pass.
+
+        The DeviceTransferManager:
+        - Uses dedicated transfer streams per GPU (separate from compute)
+        - Uses CUDA events for fine-grained synchronization (no full device syncs)
+        - Pre-stages modulation tensors to all GPUs at once
+        - Ensures the default stream on the output device sees all operations
+          before returning, which is required for autograd backward pass safety
+        """
+        # Set up transfer manager for multi-GPU stream transfers
+        transfer_mgr = self._setup_transfer_manager()
+
         with torch.no_grad():
             txt, txt_ids = batched_prc_txt(text_embeddings.text_embeds)
             packed_latents, img_ids = batched_prc_img(latent_model_input)
@@ -417,14 +541,42 @@ class Flux2Model(BaseModel):
 
             cast_dtype = self.model.dtype
 
-        packed_noise_pred = self.transformer(
-            x=img_input.to(self.device_torch, cast_dtype),
-            x_ids=img_input_ids.to(self.device_torch),
-            timesteps=timestep.to(self.device_torch, cast_dtype) / 1000,
-            ctx=txt.to(self.device_torch, cast_dtype),
-            ctx_ids=txt_ids.to(self.device_torch),
-            guidance=guidance_vec.to(self.device_torch, cast_dtype),
-        )
+        # Run transformer forward pass
+        # If transfer manager is set up, use context manager for proper stream handling
+        if transfer_mgr is not None:
+            # Debug: Log that we're using stream-based path
+            if transfer_mgr._debug:
+                print(f"[Flux2Model] Using stream-based multi-GPU path (output_device={transfer_mgr.output_device})")
+            with transfer_mgr:
+                # Set global transfer manager for block forwards to access
+                set_transfer_manager(transfer_mgr)
+
+                try:
+                    packed_noise_pred = self.transformer(
+                        x=img_input.to(self.device_torch, cast_dtype),
+                        x_ids=img_input_ids.to(self.device_torch),
+                        timesteps=timestep.to(self.device_torch, cast_dtype) / 1000,
+                        ctx=txt.to(self.device_torch, cast_dtype),
+                        ctx_ids=txt_ids.to(self.device_torch),
+                        guidance=guidance_vec.to(self.device_torch, cast_dtype),
+                    )
+                finally:
+                    # Always clear the global transfer manager
+                    set_transfer_manager(None)
+
+            # The transfer_mgr context exit calls _join_default_stream()
+            # which ensures the default stream sees all operations - required
+            # for autograd backward pass safety
+        else:
+            # Standard path without stream-based transfers
+            packed_noise_pred = self.transformer(
+                x=img_input.to(self.device_torch, cast_dtype),
+                x_ids=img_input_ids.to(self.device_torch),
+                timesteps=timestep.to(self.device_torch, cast_dtype) / 1000,
+                ctx=txt.to(self.device_torch, cast_dtype),
+                ctx_ids=txt_ids.to(self.device_torch),
+                guidance=guidance_vec.to(self.device_torch, cast_dtype),
+            )
 
         if img_cond_seq is not None:
             packed_noise_pred = packed_noise_pred[:, : packed_latents.shape[1]]

@@ -159,7 +159,7 @@ class LoRMConfig:
         })
 
 
-NetworkType = Literal['lora', 'locon', 'lorm', 'lokr']
+NetworkType = Literal['lora', 'locon', 'lorm', 'lokr', 'loha', 'dora', 'boft', 'diag-oft']
 
 
 class NetworkConfig:
@@ -199,18 +199,47 @@ class NetworkConfig:
         
         self.lokr_full_rank = kwargs.get('lokr_full_rank', False)
         if self.lokr_full_rank and self.type.lower() == 'lokr':
-            self.linear = 9999999999
-            self.linear_alpha = 9999999999
-            self.conv = 9999999999
-            self.conv_alpha = 9999999999
+            # Use sentinel values and let LokrModule clamp to the full viable rank
+            # (min(in_dim, out_dim)). Alpha is set to 0 so the module will
+            # replace it with the resolved rank, avoiding huge scales.
+            self.linear = -1
+            self.linear_alpha = 0
+            self.conv = -1
+            self.conv_alpha = 0
         # -1 automatically finds the largest factor
         self.lokr_factor = kwargs.get('lokr_factor', -1)
+        # Advanced LyCORIS parameters
+        # DoRA-style weight decomposition (works with lokr, loha)
+        self.weight_decompose = kwargs.get('weight_decompose', False)
+        # Direction of weight decomposition (True = output, False = input)
+        self.wd_on_out = kwargs.get('wd_on_out', True)
+        # Trainable scalar for weight difference
+        self.use_scalar = kwargs.get('use_scalar', False)
+        # Tucker decomposition for conv layers (loha, lokr)
+        self.use_tucker = kwargs.get('use_tucker', False)
+        # Rank-stabilized LoRA scaling (scale by sqrt(rank) instead of rank)
+        self.rs_lora = kwargs.get('rs_lora', False)
+        # Decompose both matrices in LoKr
+        self.decompose_both = kwargs.get('decompose_both', False)
+        # Scale rank dropout by mean
+        self.rank_dropout_scale = kwargs.get('rank_dropout_scale', False)
+        # Bypass mode for quantized models (Y = WX + ΔWX instead of Y = (W+ΔW)X)
+        self.bypass_mode = kwargs.get('bypass_mode', None)
+        # Unbalanced factorization for LoKr
+        self.unbalanced_factorization = kwargs.get('unbalanced_factorization', False)
+        # OFT constraint (regularization strength)
+        self.constraint = kwargs.get('constraint', 0.0)
+        # OFT rescaled (learnable rescaling)
+        self.rescaled = kwargs.get('rescaled', False)
+
         
         # for multi stage models
         self.split_multistage_loras = kwargs.get('split_multistage_loras', True)
-        
-        # ramtorch, doesn't work yet
+
+        # layer offloading for network (LoRA/LoHA/etc)
         self.layer_offloading = kwargs.get('layer_offloading', False)
+        # 0 is off and 1.0 is 100% of the layers (default: 1.0 = offload all)
+        self.layer_offloading_percent = kwargs.get('layer_offloading_percent', 1.0)
 
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
@@ -552,6 +581,16 @@ class TrainConfig:
         # for multi stage models, how often to switch the boundary
         self.switch_boundary_every: int = kwargs.get('switch_boundary_every', 1)
 
+        # Distributed training settings
+        self.distributed: bool = kwargs.get('distributed', False)
+        self.dist_backend: str = kwargs.get('dist_backend', 'nccl')  # nccl for GPU, gloo for CPU
+        self.dist_mode: str = kwargs.get('dist_mode', 'ddp')  # ddp or fsdp
+        
+        # FSDP-specific settings (only used when dist_mode='fsdp')
+        self.fsdp_auto_wrap: bool = kwargs.get('fsdp_auto_wrap', True)
+        self.fsdp_sharding: str = kwargs.get('fsdp_sharding', 'full')  # full or hybrid
+        self.fsdp_mixed_precision: str = kwargs.get('fsdp_mixed_precision', 'bf16')  # bf16 or fp16 or none
+
 
 ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flux2', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
 
@@ -619,6 +658,27 @@ class ModelConfig:
         self.qtype_te = kwargs.get("qtype_te", "qfloat8")
         self.low_vram = kwargs.get("low_vram", False)
         self.attn_masking = kwargs.get("attn_masking", False)
+
+        # Attention backend selection for Flux.2 transformer blocks ONLY.
+        # NOTE: This setting only affects Flux.2 models. Other models (SDXL, SD1.5, etc.)
+        # use the attention_backend in TrainConfig which configures diffusers backends.
+        #
+        # Options:
+        # 'auto': Use CuTE on Blackwell (SM >= 10.0), Flash on Ampere/Hopper, SDPA fallback
+        # 'sdpa': Force PyTorch SDPA (always available)
+        # 'flash': Force Flash Attention 2 (Triton-based)
+        # 'cute': Force Flash Attention CuTE (CUTLASS DSL, Blackwell-optimized)
+        #
+        # dtype behavior: CuTE/Flash require bf16 or fp16. If dtype=fp32 at init time,
+        # backend selection will fall back to SDPA. Under autocast, tensors will be bf16
+        # even if model weights are fp32, so CuTE/Flash can still be used.
+        self.attention_backend: str = kwargs.get('attention_backend', 'auto')
+
+        # Minimum sequence length to use CuTE (below this, transpose overhead makes SDPA faster)
+        # Applied at runtime per-call, not during backend selection
+        # Recommendation: 1536-2048 if gradient_checkpointing is enabled
+        # NOTE: Only affects Flux.2 when attention_backend='cute' or 'auto' on Blackwell
+        self.cute_min_seqlen: int = kwargs.get('cute_min_seqlen', 1024)
         if self.attn_masking and not self.is_flux:
             raise ValueError("attn_masking is only supported with flux models currently")
         # for targeting a specific layers
@@ -630,7 +690,42 @@ class ModelConfig:
         self.split_model_over_gpus = kwargs.get("split_model_over_gpus", False)
         # Note: validation for split_model_over_gpus moved to after arch processing (see below)
         self.split_model_other_module_param_count_scale = kwargs.get("split_model_other_module_param_count_scale", 0.3)
-        
+
+        # Explicit GPU split configuration for deterministic block distribution
+        # gpu_split_double: list of ints specifying double blocks per GPU, e.g., [4, 4] for 2 GPUs
+        # gpu_split_single: list of ints specifying single blocks per GPU, e.g., [24, 24] for 2 GPUs
+        self.gpu_split_double: list = kwargs.get("gpu_split_double", None)
+        self.gpu_split_single: list = kwargs.get("gpu_split_single", None)
+
+        # use_stream_transfers: enable CUDA stream-based transfers for overlapped compute/transfer
+        # When enabled, uses DeviceTransferManager for fine-grained event-based synchronization
+        # instead of per-block device synchronization. Recommended for best throughput.
+        self.use_stream_transfers: bool = kwargs.get("use_stream_transfers", False)
+
+        # sync_per_block: synchronize device after each block's transfers (default: False)
+        # Only used when use_stream_transfers=False. When True, each block waits for
+        # transfers to complete before compute. This is the safest but slowest option.
+        # When False (default), relies on PyTorch's default stream ordering.
+        self.sync_per_block: bool = kwargs.get("sync_per_block", False)
+
+        # output_device: device where final transformer output should reside
+        # Should match where loss will be computed. Default: cuda:0 (first GPU)
+        # Can be specified as "cuda:0", "cuda:1", etc.
+        self.output_device: Optional[str] = kwargs.get("output_device", None)
+
+        # Validate gpu_split options
+        if self.gpu_split_double is not None:
+            if not isinstance(self.gpu_split_double, list) or not all(isinstance(x, int) for x in self.gpu_split_double):
+                raise ValueError(f"gpu_split_double must be a list of integers, got {type(self.gpu_split_double)}")
+            if len(self.gpu_split_double) < 1:
+                raise ValueError(f"gpu_split_double must have at least 1 element")
+
+        if self.gpu_split_single is not None:
+            if not isinstance(self.gpu_split_single, list) or not all(isinstance(x, int) for x in self.gpu_split_single):
+                raise ValueError(f"gpu_split_single must be a list of integers, got {type(self.gpu_split_single)}")
+            if len(self.gpu_split_single) < 1:
+                raise ValueError(f"gpu_split_single must have at least 1 element")
+
         self.te_name_or_path = kwargs.get("te_name_or_path", None)
         
         self.arch: ModelArch = kwargs.get("arch", None)
@@ -734,6 +829,49 @@ class ModelConfig:
         # Validate split_model_over_gpus after arch processing (is_flux/is_flux2 are now set)
         if self.split_model_over_gpus and not (self.is_flux or self.is_flux2):
             raise ValueError("split_model_over_gpus is only supported with flux and flux2 models currently")
+
+        # Validate gpu_split options for FLUX.2 (8 double blocks, 48 single blocks)
+        if self.is_flux2:
+            if self.gpu_split_double is not None and sum(self.gpu_split_double) != 8:
+                raise ValueError(f"gpu_split_double must sum to 8 for FLUX.2, got {sum(self.gpu_split_double)}")
+            if self.gpu_split_single is not None and sum(self.gpu_split_single) != 48:
+                raise ValueError(f"gpu_split_single must sum to 48 for FLUX.2, got {sum(self.gpu_split_single)}")
+
+        # Validate gpu_split options for FLUX.1 (19 double blocks, 38 single blocks)
+        if self.is_flux:
+            if self.gpu_split_double is not None and sum(self.gpu_split_double) != 19:
+                raise ValueError(f"gpu_split_double must sum to 19 for FLUX.1, got {sum(self.gpu_split_double)}")
+            if self.gpu_split_single is not None and sum(self.gpu_split_single) != 38:
+                raise ValueError(f"gpu_split_single must sum to 38 for FLUX.1, got {sum(self.gpu_split_single)}")
+
+        # Warn about layer_offloading conflict with split_model_over_gpus
+        if self.split_model_over_gpus and self.layer_offloading:
+            print("Warning: layer_offloading and split_model_over_gpus conflict. layer_offloading will be disabled.")
+
+        # Log and validate stream transfer configuration
+        if self.split_model_over_gpus:
+            if self.use_stream_transfers:
+                print("Info: Stream-based transfers ENABLED for multi-GPU model splitting.")
+                print("      This uses CUDA events for fine-grained synchronization.")
+                if self.sync_per_block:
+                    print("Warning: sync_per_block is ignored when use_stream_transfers=True")
+            else:
+                print("Info: Stream-based transfers DISABLED. Using default PyTorch stream ordering.")
+                if self.sync_per_block:
+                    print("Info: Per-block synchronization ENABLED (may reduce throughput)")
+                else:
+                    print("Info: Per-block synchronization DISABLED (relies on PyTorch stream ordering)")
+
+            if self.output_device is not None:
+                print(f"Info: Output device set to {self.output_device}")
+
+        # Warn if layer_offloading_transformer_percent is set but offloading is disabled
+        if not self.layer_offloading and kwargs.get("layer_offloading_transformer_percent", 0) > 0:
+            print("Warning: layer_offloading_transformer_percent is set but layer_offloading is disabled. "
+                  "The percent value will be ignored.")
+        if not self.layer_offloading and kwargs.get("layer_offloading_text_encoder_percent", 0) > 0:
+            print("Warning: layer_offloading_text_encoder_percent is set but layer_offloading is disabled. "
+                  "The percent value will be ignored.")
 
 
 class EMAConfig:
@@ -1315,6 +1453,11 @@ def validate_configs(
     if train_config.bypass_guidance_embedding and train_config.do_guidance_loss:
         raise ValueError("Cannot bypass guidance embedding and do guidance loss at the same time. "
                          "Please set bypass_guidance_embedding to False or do_guidance_loss to False.")
+        
+    if model_config.accuracy_recovery_adapter is not None:
+        if model_config.assistant_lora_path is not None:
+            raise ValueError("Cannot use accuracy recovery adapter and assistant lora at the same time. "
+                             "Please set one of them to None.")
 
     # see if any datasets are caching text embeddings
     is_caching_text_embeddings = any(dataset.cache_text_embeddings for dataset in dataset_configs)
