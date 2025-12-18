@@ -2098,10 +2098,12 @@ class SDTrainer(BaseSDTrainProcess):
 
         # One-time debug log for alpha tracking settings
         if not hasattr(self, '_logged_alpha_tracking_settings'):
+            cache_limit = getattr(self.optimizer, '_alpha_tracking_cache_limit', 5000)
+            max_sign_samples = getattr(self.optimizer, '_alpha_tracking_max_sign_samples', 1024)
             print_acc(
                 f"[AlphaTracking] sample_rate={self.optimizer._alpha_tracking_sample_rate}, "
                 f"interval={self.optimizer._alpha_tracking_interval}, "
-                f"sign_cache_limit=200, max_sign_samples_per_param=1024"
+                f"sign_cache_limit={cache_limit}, max_sign_samples_per_param={max_sign_samples}"
             )
             self._logged_alpha_tracking_settings = True
 
@@ -2119,8 +2121,9 @@ class SDTrainer(BaseSDTrainProcess):
                 param_id = id(p)
 
                 # Compute a downsampled sign vector to limit memory
-                # Keep at most ~1024 elements per parameter
-                stride = max(1, p.grad.numel() // 1024)
+                # Keep at most ~max_sign_samples elements per parameter
+                max_sign_samples = getattr(self.optimizer, '_alpha_tracking_max_sign_samples', 1024)
+                stride = max(1, (p.grad.numel() + max_sign_samples - 1) // max_sign_samples)
                 current_signs = (p.grad.flatten()[::stride] > 0).cpu().to(torch.bool)
 
                 if param_id in self.optimizer._prev_grad_signs:
@@ -2146,7 +2149,8 @@ class SDTrainer(BaseSDTrainProcess):
                 self.optimizer._prev_grad_signs[param_id] = current_signs
 
         # Clear old sign history aggressively to prevent memory growth
-        if len(self.optimizer._prev_grad_signs) > 200:
+        cache_limit = getattr(self.optimizer, '_alpha_tracking_cache_limit', 5000)
+        if len(self.optimizer._prev_grad_signs) > cache_limit:
             self.optimizer._prev_grad_signs.clear()
 
         if agreement_weight > 0:

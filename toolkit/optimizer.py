@@ -56,6 +56,13 @@ def get_optimizer(
         if 'split_groups' not in optimizer_params:
             optimizer_params['split_groups'] = True
 
+        # Pop ai-toolkit-only options so they are not passed to ProdigyPlusScheduleFree
+        enable_alpha_tracking = optimizer_params.pop('enable_alpha_tracking', False)
+        alpha_tracking_cache_limit = optimizer_params.pop('alpha_tracking_cache_limit', 5000)
+        alpha_tracking_interval = optimizer_params.pop('alpha_tracking_interval', 20)
+        alpha_tracking_sample_rate = optimizer_params.pop('alpha_tracking_sample_rate', 0.05)
+        alpha_tracking_max_sign_samples = optimizer_params.pop('alpha_tracking_max_sign_samples', 1024)
+
         # Extract per-expert LR params for MoE support (convert to per-group lr)
         # These will be set by _prepare_moe_optimizer_params in lora_special.py
         high_noise_lr = optimizer_params.pop('high_noise_lr', None)
@@ -76,19 +83,24 @@ def get_optimizer(
         # Optional: Add alpha scheduler tracking (opt-in for compatibility)
         # This enables ProdigyPlus to work with alpha schedulers that need
         # gradient stability and loss history (mimics Automagic behavior)
-        enable_alpha_tracking = optimizer_params.get('enable_alpha_tracking', False)
-
         if enable_alpha_tracking:
             import types
             from toolkit.print import print_acc
+
             print_acc("  [ProdigyPlus] Enabling gradient stability tracking for alpha scheduler")
-            print_acc("    Conservative settings: 5% param sample, every 20 steps")
+            print_acc(
+                f"    Settings: sample_rate={alpha_tracking_sample_rate}, "
+                f"interval={alpha_tracking_interval}, cache_limit={alpha_tracking_cache_limit}, "
+                f"max_sign_samples={alpha_tracking_max_sign_samples}"
+            )
 
             optimizer._gradient_sign_agreements = []
             optimizer.recent_losses = []
             optimizer._prev_grad_signs = {}
-            optimizer._alpha_tracking_interval = 20  # Sample every 20 steps (conservative)
-            optimizer._alpha_tracking_sample_rate = 0.05  # Sample 5% of params (conservative)
+            optimizer._alpha_tracking_interval = alpha_tracking_interval
+            optimizer._alpha_tracking_sample_rate = alpha_tracking_sample_rate
+            optimizer._alpha_tracking_cache_limit = alpha_tracking_cache_limit
+            optimizer._alpha_tracking_max_sign_samples = alpha_tracking_max_sign_samples
             optimizer._alpha_tracking_step_counter = 0
 
             def get_gradient_sign_agreement_rate(self):

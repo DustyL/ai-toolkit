@@ -458,7 +458,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     'enabled': True,
                     'sample_rate': self.optimizer._alpha_tracking_sample_rate,
                     'interval': self.optimizer._alpha_tracking_interval,
-                    'sign_cache_limit': 200,
+                    'sign_cache_limit': getattr(self.optimizer, '_alpha_tracking_cache_limit', 5000),
                     'max_samples_per_param': 1024,
                 }
 
@@ -2691,14 +2691,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             loss_value = loss_dict[key]
                             break
 
-                    # Fallback: first scalar value if no known key found
+                    # Fallback: prefer keys containing 'loss', then any scalar
                     if loss_value is None and len(loss_dict) > 0:
+                        # First pass: try keys containing 'loss'
                         for k, v in loss_dict.items():
-                            if isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1):
+                            if 'loss' in k.lower() and (isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1)):
                                 loss_value = v
-                                if k != 'loss':  # Warn if using non-standard key
-                                    print_acc(f"[AlphaScheduler] Warning: Using loss key '{k}' (expected 'loss')")
+                                print_acc(f"[AlphaScheduler] Warning: Using loss key '{k}' (expected 'loss')")
                                 break
+                        # Second pass: fallback to any scalar if no loss-like key found
+                        if loss_value is None:
+                            for k, v in loss_dict.items():
+                                if isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1):
+                                    loss_value = v
+                                    print_acc(f"[AlphaScheduler] Warning: Using non-loss key '{k}' as loss fallback")
+                                    break
 
                     # Only update if we have a finite loss value
                     if loss_value is not None:
