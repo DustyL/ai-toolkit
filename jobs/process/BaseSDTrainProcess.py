@@ -452,6 +452,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if key in first_group:
                         optimizer_meta[key] = first_group[key]
 
+            # Add alpha tracking settings if enabled
+            if hasattr(self.optimizer, '_gradient_sign_agreements'):
+                optimizer_meta['alpha_tracking'] = {
+                    'enabled': True,
+                    'sample_rate': self.optimizer._alpha_tracking_sample_rate,
+                    'interval': self.optimizer._alpha_tracking_interval,
+                    'sign_cache_limit': 200,
+                    'max_samples_per_param': 1024,
+                }
+
             o_dict['optimizer_config'] = optimizer_meta
 
         self.add_meta(o_dict)

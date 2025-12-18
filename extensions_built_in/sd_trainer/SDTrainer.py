@@ -2096,37 +2096,58 @@ class SDTrainer(BaseSDTrainProcess):
         if self.optimizer._alpha_tracking_step_counter % self.optimizer._alpha_tracking_interval != 0:
             return  # Skip this step for performance
 
+        # One-time debug log for alpha tracking settings
+        if not hasattr(self, '_logged_alpha_tracking_settings'):
+            print_acc(
+                f"[AlphaTracking] sample_rate={self.optimizer._alpha_tracking_sample_rate}, "
+                f"interval={self.optimizer._alpha_tracking_interval}, "
+                f"sign_cache_limit=200, max_sign_samples_per_param=1024"
+            )
+            self._logged_alpha_tracking_settings = True
+
         # Sample a subset of parameters
         agreement_sum = 0.0
         agreement_weight = 0.0
 
-        for group in self.optimizer.param_groups:
+        for group_idx, group in enumerate(self.optimizer.param_groups):
             params_to_sample = []
             for p in group['params']:
                 if p.grad is not None and random.random() < self.optimizer._alpha_tracking_sample_rate:
                     params_to_sample.append(p)
 
-            for p in params_to_sample:
+            for param_idx, p in enumerate(params_to_sample):
                 param_id = id(p)
 
-                # Compute current signs compactly (move to CPU to save VRAM)
-                current_signs = (p.grad > 0).cpu().to(torch.bool)
+                # Compute a downsampled sign vector to limit memory
+                # Keep at most ~1024 elements per parameter
+                stride = max(1, p.grad.numel() // 1024)
+                current_signs = (p.grad.flatten()[::stride] > 0).cpu().to(torch.bool)
 
                 if param_id in self.optimizer._prev_grad_signs:
                     prev_signs = self.optimizer._prev_grad_signs[param_id]
-                    agreements = (current_signs == prev_signs).float()
-                    agreement_sum += agreements.sum().item()
-                    agreement_weight += current_signs.numel()
 
-                # Store compactly (bool on CPU, only 1 byte per element)
+                    # Validate shape match before comparison (params could resize)
+                    if current_signs.shape == prev_signs.shape:
+                        agreements = (current_signs == prev_signs).float()
+                        agreement_sum += agreements.sum().item()
+                        agreement_weight += current_signs.numel()
+                    else:
+                        # Log first shape mismatch for debugging (once)
+                        if not hasattr(self, '_logged_alpha_shape_mismatch'):
+                            print_acc(
+                                f"[AlphaTracking] Shape mismatch detected: "
+                                f"group={group_idx} param={param_idx} numel={p.grad.numel()} "
+                                f"prev_shape={prev_signs.shape} curr_shape={current_signs.shape} "
+                                f"(skipping agreement, will update stored signs)"
+                            )
+                            self._logged_alpha_shape_mismatch = True
+
+                # Store compactly (bool on CPU, only ~1KB per parameter sampled)
                 self.optimizer._prev_grad_signs[param_id] = current_signs
 
-        # Clear old sign history periodically to prevent unbounded growth
-        if self.optimizer._alpha_tracking_step_counter % 10000 == 0:
-            # Keep only most recent params (in case params are re-created)
-            if len(self.optimizer._prev_grad_signs) > 100:
-                # This is conservative - keeps up to 100 param histories
-                self.optimizer._prev_grad_signs.clear()
+        # Clear old sign history aggressively to prevent memory growth
+        if len(self.optimizer._prev_grad_signs) > 200:
+            self.optimizer._prev_grad_signs.clear()
 
         if agreement_weight > 0:
             overall_agreement = agreement_sum / agreement_weight
