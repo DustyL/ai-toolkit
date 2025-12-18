@@ -42,6 +42,36 @@ def get_optimizer(
         # let net be the neural network you want to train
         # you can choose weight decay value based on your problem, 0 by default
         optimizer = Prodigy8bit(params, lr=use_lr, eps=1e-6, **optimizer_params)
+    elif lower_type.startswith("prodigy_plus") or lower_type.startswith("prodigyplus"):
+        from prodigyplus import ProdigyPlusScheduleFree
+        print("Using ProdigyPlusScheduleFree optimizer")
+        use_lr = learning_rate
+        if use_lr < 0.1:
+            # Prodigy uses adaptive lr, so values of 0.1 to 1.0 are typical. default to 1.0
+            use_lr = 1.0
+
+        print(f"Using lr {use_lr}")
+
+        # Set sensible defaults for split_groups (enables per-param-group d values)
+        if 'split_groups' not in optimizer_params:
+            optimizer_params['split_groups'] = True
+
+        # Extract per-expert LR params for MoE support (convert to per-group lr)
+        # These will be set by _prepare_moe_optimizer_params in lora_special.py
+        high_noise_lr = optimizer_params.pop('high_noise_lr', None)
+        low_noise_lr = optimizer_params.pop('low_noise_lr', None)
+        # Also remove Automagic-specific params that don't apply to Prodigy
+        for key in ['high_noise_lr_bump', 'low_noise_lr_bump',
+                    'high_noise_min_lr', 'low_noise_min_lr',
+                    'high_noise_max_lr', 'low_noise_max_lr']:
+            optimizer_params.pop(key, None)
+
+        optimizer = ProdigyPlusScheduleFree(params, lr=use_lr, **optimizer_params)
+
+        # Add train/eval methods for Schedule-Free mode compatibility
+        # These need to be called when switching between training and eval
+        if hasattr(optimizer, 'train') and hasattr(optimizer, 'eval'):
+            print("  Schedule-Free mode enabled - remember to call optimizer.train()/eval() when switching modes")
     elif lower_type.startswith("prodigy"):
         from prodigyopt import Prodigy
 

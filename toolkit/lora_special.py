@@ -677,7 +677,14 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
     def _prepare_moe_optimizer_params(self, text_encoder_lr, unet_lr, default_lr, optimizer_params):
         """
         Prepare optimizer params with separate groups for High Noise and Low Noise experts.
-        Allows per-expert lr_bump, min_lr, max_lr configuration for automagic optimizer.
+
+        Supports two styles of per-expert configuration:
+        1. Automagic: per-expert lr_bump, min_lr, max_lr (e.g., high_noise_lr_bump, low_noise_min_lr)
+        2. Prodigy-style: per-expert lr multiplier (e.g., high_noise_lr, low_noise_lr)
+
+        For prodigy-plus-schedule-free, use high_noise_lr and low_noise_lr as multipliers:
+        - high_noise_lr: 1.2 means 20% higher LR for high noise expert
+        - low_noise_lr: 1.0 means standard LR for low noise expert
         """
         self.requires_grad_(True)
         all_params = []
@@ -712,15 +719,28 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                     other_loras.append(lora)
 
             # Extract per-expert optimizer params with fallback to defaults
+            # Automagic-style params
             default_lr_bump = optimizer_params.get('lr_bump')
             default_min_lr = optimizer_params.get('min_lr')
             default_max_lr = optimizer_params.get('max_lr')
+            # Prodigy-style params (per-group lr multipliers)
+            high_noise_lr = optimizer_params.get('high_noise_lr')
+            low_noise_lr = optimizer_params.get('low_noise_lr')
 
             # High Noise Expert param group
             if high_noise_loras:
                 high_noise_params = {"params": enumerate_params(high_noise_loras)}
+                # Only set explicit LR if unet_lr is provided; otherwise let optimizer use its default
                 if unet_lr is not None:
-                    high_noise_params["lr"] = unet_lr
+                    if high_noise_lr is not None:
+                        # high_noise_lr is a multiplier (e.g., 1.2 = 20% higher than unet_lr)
+                        high_noise_params["lr"] = unet_lr * high_noise_lr
+                    else:
+                        high_noise_params["lr"] = unet_lr
+                elif high_noise_lr is not None:
+                    # Multiplier specified but no base LR - warn user
+                    print(f"WARNING: high_noise_lr={high_noise_lr} specified but unet_lr is not set. "
+                          "Multiplier cannot be applied; using optimizer default LR.")
 
                 # Add per-expert optimizer params if using automagic
                 if default_lr_bump is not None:
@@ -731,13 +751,24 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                     high_noise_params["max_lr"] = optimizer_params.get('high_noise_max_lr', default_max_lr)
 
                 all_params.append(high_noise_params)
-                print(f"High Noise Expert: {len(high_noise_loras)} LoRA modules")
+                lr_info = f" (lr={high_noise_params['lr']:.2e}, multiplier={high_noise_lr})" if 'lr' in high_noise_params and high_noise_lr is not None else \
+                          f" (lr={high_noise_params['lr']:.2e})" if 'lr' in high_noise_params else " (using optimizer default)"
+                print(f"High Noise Expert: {len(high_noise_loras)} LoRA modules" + lr_info)
 
             # Low Noise Expert param group
             if low_noise_loras:
                 low_noise_params = {"params": enumerate_params(low_noise_loras)}
+                # Only set explicit LR if unet_lr is provided; otherwise let optimizer use its default
                 if unet_lr is not None:
-                    low_noise_params["lr"] = unet_lr
+                    if low_noise_lr is not None:
+                        # low_noise_lr is a multiplier (e.g., 0.8 = 20% lower than unet_lr)
+                        low_noise_params["lr"] = unet_lr * low_noise_lr
+                    else:
+                        low_noise_params["lr"] = unet_lr
+                elif low_noise_lr is not None:
+                    # Multiplier specified but no base LR - warn user
+                    print(f"WARNING: low_noise_lr={low_noise_lr} specified but unet_lr is not set. "
+                          "Multiplier cannot be applied; using optimizer default LR.")
 
                 # Add per-expert optimizer params if using automagic
                 if default_lr_bump is not None:
@@ -748,7 +779,9 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                     low_noise_params["max_lr"] = optimizer_params.get('low_noise_max_lr', default_max_lr)
 
                 all_params.append(low_noise_params)
-                print(f"Low Noise Expert: {len(low_noise_loras)} LoRA modules")
+                lr_info = f" (lr={low_noise_params['lr']:.2e}, multiplier={low_noise_lr})" if 'lr' in low_noise_params and low_noise_lr is not None else \
+                          f" (lr={low_noise_params['lr']:.2e})" if 'lr' in low_noise_params else " (using optimizer default)"
+                print(f"Low Noise Expert: {len(low_noise_loras)} LoRA modules" + lr_info)
 
             # Other loras (not transformer-specific) - use defaults
             if other_loras:
