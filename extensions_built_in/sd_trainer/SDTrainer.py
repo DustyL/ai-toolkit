@@ -2033,6 +2033,107 @@ class SDTrainer(BaseSDTrainProcess):
         return loss.detach()
         # flush()
 
+    def hook_before_sample(self):
+        """Switch Schedule-Free optimizer to eval mode for inference.
+
+        Called by BaseSDTrainProcess.sample() on main rank only before generating samples.
+        This switches the optimizer to use temporally-averaged weights (z) instead of
+        training weights (y) for better sample quality.
+        """
+        # Guard: only if optimizer exists and has eval method
+        if not hasattr(self, 'optimizer') or self.optimizer is None:
+            return
+
+        if hasattr(self.optimizer, 'eval') and callable(self.optimizer.eval):
+            # Debug log (only once to avoid spam)
+            if not hasattr(self, '_logged_schedulefree_toggle'):
+                print_acc("[Schedule-Free] Switching to eval mode for sampling (using z-weights)")
+                self._logged_schedulefree_toggle = True
+
+            self.optimizer.eval()
+
+    def hook_after_sample(self):
+        """Switch Schedule-Free optimizer back to train mode.
+
+        Called by BaseSDTrainProcess.sample() on main rank only after generating samples.
+        This switches the optimizer back to training mode, using y-weights for updates.
+        """
+        # Guard: only if optimizer exists and has train method
+        if not hasattr(self, 'optimizer') or self.optimizer is None:
+            return
+
+        if hasattr(self.optimizer, 'train') and callable(self.optimizer.train):
+            self.optimizer.train()
+
+    def _update_alpha_tracking(self, loss):
+        """Update gradient stability and loss tracking for alpha scheduler (sparse sampling).
+
+        This method implements conservative gradient sign agreement tracking:
+        - Samples only 5% of parameters (configurable)
+        - Runs every 20 steps (configurable)
+        - Stores signs on CPU to save VRAM
+        - Clears old history to prevent memory growth
+        - Runs on main rank only to avoid duplicate overhead in DDP
+        """
+        # Guard: Alpha tracking not enabled
+        if not hasattr(self.optimizer, '_gradient_sign_agreements'):
+            return
+
+        # Guard: DDP rank-0 only (avoid duplicate overhead)
+        if hasattr(self, 'is_main_process') and not self.is_main_process:
+            return
+
+        # Track losses every step (cheap operation)
+        if loss is not None:
+            loss_value = loss.item() if torch.is_tensor(loss) else float(loss)
+            if math.isfinite(loss_value):
+                self.optimizer.recent_losses.append(loss_value)
+                if len(self.optimizer.recent_losses) > 1000:
+                    self.optimizer.recent_losses.pop(0)
+
+        # Track gradient stability SPARSELY (expensive operation)
+        self.optimizer._alpha_tracking_step_counter += 1
+        if self.optimizer._alpha_tracking_step_counter % self.optimizer._alpha_tracking_interval != 0:
+            return  # Skip this step for performance
+
+        # Sample a subset of parameters
+        agreement_sum = 0.0
+        agreement_weight = 0.0
+
+        for group in self.optimizer.param_groups:
+            params_to_sample = []
+            for p in group['params']:
+                if p.grad is not None and random.random() < self.optimizer._alpha_tracking_sample_rate:
+                    params_to_sample.append(p)
+
+            for p in params_to_sample:
+                param_id = id(p)
+
+                # Compute current signs compactly (move to CPU to save VRAM)
+                current_signs = (p.grad > 0).cpu().to(torch.bool)
+
+                if param_id in self.optimizer._prev_grad_signs:
+                    prev_signs = self.optimizer._prev_grad_signs[param_id]
+                    agreements = (current_signs == prev_signs).float()
+                    agreement_sum += agreements.sum().item()
+                    agreement_weight += current_signs.numel()
+
+                # Store compactly (bool on CPU, only 1 byte per element)
+                self.optimizer._prev_grad_signs[param_id] = current_signs
+
+        # Clear old sign history periodically to prevent unbounded growth
+        if self.optimizer._alpha_tracking_step_counter % 10000 == 0:
+            # Keep only most recent params (in case params are re-created)
+            if len(self.optimizer._prev_grad_signs) > 100:
+                # This is conservative - keeps up to 100 param histories
+                self.optimizer._prev_grad_signs.clear()
+
+        if agreement_weight > 0:
+            overall_agreement = agreement_sum / agreement_weight
+            self.optimizer._gradient_sign_agreements.append(overall_agreement)
+            if len(self.optimizer._gradient_sign_agreements) > 1000:
+                self.optimizer._gradient_sign_agreements.pop(0)
+
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
             batch_list = batch
@@ -2118,5 +2219,8 @@ class SDTrainer(BaseSDTrainProcess):
         )
 
         self.end_of_training_loop()
+
+        # Update alpha tracking if enabled (gradient stability + loss history)
+        self._update_alpha_tracking(loss_dict.get('loss'))
 
         return loss_dict

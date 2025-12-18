@@ -301,6 +301,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def sample(self, step=None, is_first=False):
         if not self.is_main_process:
             return
+
+        # Call pre-sample hook (for Schedule-Free optimizer mode switching)
+        # This is implemented in SDTrainer to switch optimizer to eval mode
+        if hasattr(self, 'hook_before_sample'):
+            self.hook_before_sample()
+
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
@@ -403,6 +409,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
 
+        # Call post-sample hook (for Schedule-Free optimizer mode switching)
+        # This is implemented in SDTrainer to switch optimizer back to train mode
+        if hasattr(self, 'hook_after_sample'):
+            self.hook_after_sample()
+
     def update_training_metadata(self):
         o_dict = OrderedDict({
             "training_info": self.get_training_info()
@@ -423,6 +434,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"{self.trigger_word}": 1
                 }
             }
+
+        # Add optimizer configuration for reproducibility
+        if hasattr(self, 'optimizer') and self.optimizer is not None:
+            optimizer_meta = {
+                'optimizer_type': self.train_config.optimizer if hasattr(self.train_config, 'optimizer') else 'unknown',
+            }
+
+            # For ProdigyPlus, log key hyperparameters
+            if hasattr(self.optimizer, 'param_groups') and len(self.optimizer.param_groups) > 0:
+                first_group = self.optimizer.param_groups[0]
+
+                # Log critical Prodigy parameters if they exist
+                for key in ['schedulefree_c', 'd_coef', 'd0', 'use_orthograd',
+                            'use_schedulefree', 'use_bias_correction', 'split_groups',
+                            'weight_decay', 'betas']:
+                    if key in first_group:
+                        optimizer_meta[key] = first_group[key]
+
+            o_dict['optimizer_config'] = optimizer_meta
 
         self.add_meta(o_dict)
 
@@ -2643,18 +2673,32 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     hasattr(self.network, 'alpha_scheduler') and
                     self.network.alpha_scheduler is not None and
                     loss_dict is not None):
-                    # Get the main loss value (first key or 'loss' if available)
+                    # Get the main loss value with robust key fallback
                     loss_value = None
-                    if 'loss' in loss_dict:
-                        loss_value = loss_dict['loss']
-                    elif len(loss_dict) > 0:
-                        loss_value = list(loss_dict.values())[0]
+                    # Try common keys in priority order
+                    for key in ['loss', 'train_loss', 'total_loss', 'mse_loss']:
+                        if key in loss_dict:
+                            loss_value = loss_dict[key]
+                            break
 
+                    # Fallback: first scalar value if no known key found
+                    if loss_value is None and len(loss_dict) > 0:
+                        for k, v in loss_dict.items():
+                            if isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1):
+                                loss_value = v
+                                if k != 'loss':  # Warn if using non-standard key
+                                    print_acc(f"[AlphaScheduler] Warning: Using loss key '{k}' (expected 'loss')")
+                                break
+
+                    # Only update if we have a finite loss value
                     if loss_value is not None:
-                        self.network.alpha_scheduler.update(
-                            step=self.step_num,
-                            loss=float(loss_value)
-                        )
+                        import math
+                        loss_float = float(loss_value)
+                        if math.isfinite(loss_float):
+                            self.network.alpha_scheduler.update(
+                                step=self.step_num,
+                                loss=loss_float
+                            )
 
                 self.end_step_hook()
 

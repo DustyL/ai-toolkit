@@ -460,13 +460,20 @@ class Wan2214bModel(Wan21):
         only_train_low_noise = self.train_low_noise and not self.train_high_noise
 
         for key in state_dict:
-            if ".transformer_1." in key or only_train_high_noise:
+            # Check for both dot and underscore patterns
+            # LyCORIS converts module paths: transformer_1.blocks → transformer_1_blocks
+            is_transformer_1 = ".transformer_1." in key or "_transformer_1_" in key
+            is_transformer_2 = ".transformer_2." in key or "_transformer_2_" in key
+
+            if is_transformer_1 or only_train_high_noise:
                 # this is a high noise LoRA
-                new_key = key.replace(".transformer_1.", ".")
+                # Normalize to dot notation (preserve stage marker!)
+                new_key = key.replace("_transformer_1_", ".transformer_1.")
                 high_noise_lora[new_key] = state_dict[key]
-            elif ".transformer_2." in key or only_train_low_noise:
+            elif is_transformer_2 or only_train_low_noise:
                 # this is a low noise LoRA
-                new_key = key.replace(".transformer_2.", ".")
+                # Normalize to dot notation (preserve stage marker!)
+                new_key = key.replace("_transformer_2_", ".transformer_2.")
                 low_noise_lora[new_key] = state_dict[key]
 
         # loras have either LORA_MODEL_NAME_000005000.safetensors or LORA_MODEL_NAME.safetensors
@@ -508,27 +515,58 @@ class Wan2214bModel(Wan21):
             # load the high noise LoRA
             high_noise_lora = load_file(high_noise_lora_path)
             for key in high_noise_lora:
-                new_key = key.replace(
-                    "diffusion_model.", "diffusion_model.transformer_1."
-                )
+                # Ensure stage marker is present (handle both old and new save formats)
+                if ".transformer_1." not in key and "_transformer_1_" not in key:
+                    # Key lacks stage marker - add it
+                    # Support both diffusion_model. and other prefixes (e.g., lycoris_)
+                    if "diffusion_model." in key:
+                        new_key = key.replace("diffusion_model.", "diffusion_model.transformer_1.")
+                    else:
+                        # For LyCORIS and other formats, add stage marker after prefix
+                        parts = key.split(".", 1)  # Split on first dot
+                        if len(parts) == 2:
+                            new_key = f"{parts[0]}.transformer_1.{parts[1]}"
+                        else:
+                            new_key = f"transformer_1.{key}"
+                else:
+                    # Stage marker already present
+                    new_key = key
                 combined_dict[new_key] = high_noise_lora[key]
+
         if os.path.exists(low_noise_lora_path) and self.train_low_noise:
             # load the low noise LoRA
             low_noise_lora = load_file(low_noise_lora_path)
             for key in low_noise_lora:
-                new_key = key.replace(
-                    "diffusion_model.", "diffusion_model.transformer_2."
-                )
+                # Ensure stage marker is present (handle both old and new save formats)
+                if ".transformer_2." not in key and "_transformer_2_" not in key:
+                    # Key lacks stage marker - add it
+                    # Support both diffusion_model. and other prefixes (e.g., lycoris_)
+                    if "diffusion_model." in key:
+                        new_key = key.replace("diffusion_model.", "diffusion_model.transformer_2.")
+                    else:
+                        # For LyCORIS and other formats, add stage marker after prefix
+                        parts = key.split(".", 1)  # Split on first dot
+                        if len(parts) == 2:
+                            new_key = f"{parts[0]}.transformer_2.{parts[1]}"
+                        else:
+                            new_key = f"transformer_2.{key}"
+                else:
+                    # Stage marker already present
+                    new_key = key
                 combined_dict[new_key] = low_noise_lora[key]
         
         # if we are not training both stages, we wont have transformer designations in the keys
+        # Strip stage markers for single-stage loading (must handle both dot and underscore notation)
         if not self.train_high_noise or not self.train_low_noise:
             new_dict = {}
             for key in combined_dict:
-                if ".transformer_1." in key:
-                    new_key = key.replace(".transformer_1.", ".")
-                elif ".transformer_2." in key:
-                    new_key = key.replace(".transformer_2.", ".")
+                # Check for both dot notation (.transformer_1.) and underscore notation (_transformer_1_)
+                if ".transformer_1." in key or "_transformer_1_" in key:
+                    # Normalize to no stage marker
+                    new_key = key.replace(".transformer_1.", ".").replace("_transformer_1_", "_")
+                elif ".transformer_2." in key or "_transformer_2_" in key:
+                    # Normalize to no stage marker
+                    new_key = key.replace(".transformer_2.", ".").replace("_transformer_2_", "_")
                 else:
                     new_key = key
                 new_dict[new_key] = combined_dict[key]

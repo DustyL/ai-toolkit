@@ -72,6 +72,43 @@ def get_optimizer(
         # These need to be called when switching between training and eval
         if hasattr(optimizer, 'train') and hasattr(optimizer, 'eval'):
             print("  Schedule-Free mode enabled - remember to call optimizer.train()/eval() when switching modes")
+
+        # Optional: Add alpha scheduler tracking (opt-in for compatibility)
+        # This enables ProdigyPlus to work with alpha schedulers that need
+        # gradient stability and loss history (mimics Automagic behavior)
+        enable_alpha_tracking = optimizer_params.get('enable_alpha_tracking', False)
+
+        if enable_alpha_tracking:
+            import types
+            from toolkit.print import print_acc
+            print_acc("  [ProdigyPlus] Enabling gradient stability tracking for alpha scheduler")
+            print_acc("    Conservative settings: 5% param sample, every 20 steps")
+
+            optimizer._gradient_sign_agreements = []
+            optimizer.recent_losses = []
+            optimizer._prev_grad_signs = {}
+            optimizer._alpha_tracking_interval = 20  # Sample every 20 steps (conservative)
+            optimizer._alpha_tracking_sample_rate = 0.05  # Sample 5% of params (conservative)
+            optimizer._alpha_tracking_step_counter = 0
+
+            def get_gradient_sign_agreement_rate(self):
+                """Return rolling average gradient sign agreement (0-1)."""
+                if not self._gradient_sign_agreements:
+                    return 0.0
+                recent = self._gradient_sign_agreements[-100:]
+                return float(sum(recent) / len(recent))
+
+            def get_recent_losses(self):
+                """Return recent loss values for alpha scheduler."""
+                return list(self.recent_losses)
+
+            # Bind methods to optimizer instance
+            optimizer.get_gradient_sign_agreement_rate = types.MethodType(
+                get_gradient_sign_agreement_rate, optimizer
+            )
+            optimizer.get_recent_losses = types.MethodType(
+                get_recent_losses, optimizer
+            )
     elif lower_type.startswith("prodigy"):
         from prodigyopt import Prodigy
 
