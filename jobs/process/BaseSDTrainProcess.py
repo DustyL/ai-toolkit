@@ -2047,6 +2047,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     config['default_lr'] = self.train_config.lr
                 if 'learning_rate' in sig.parameters:
                     config['learning_rate'] = self.train_config.lr
+                # Pass optimizer_params for per-expert LR configuration (MoE models)
+                if 'optimizer_params' in sig.parameters and self.train_config.optimizer_params:
+                    config['optimizer_params'] = self.train_config.optimizer_params
                 params_net = self.network.prepare_optimizer_params(
                     **config
                 )
