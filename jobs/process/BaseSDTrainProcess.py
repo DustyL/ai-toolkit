@@ -2694,12 +2694,37 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # Fallback: prefer keys containing 'loss', then any scalar (excluding known non-loss keys)
                     if loss_value is None and len(loss_dict) > 0:
                         # Known non-loss keys to exclude from fallback
-                        non_loss_keys = {'lr', 'learning_rate', 'epoch', 'step', 'global_step',
-                                        'iteration', 'batch_idx', 'rank', 'world_size'}
+                        non_loss_keys = {
+                            'lr',
+                            'learning_rate',
+                            'epoch',
+                            'step',
+                            'global_step',
+                            'iteration',
+                            'batch_idx',
+                            'rank',
+                            'world_size',
+                        }
+
+                        # Also exclude common metric prefixes (e.g., lr_0, lr_1, learning_rate_0)
+                        non_loss_prefixes = ('lr', 'learning_rate')
+
+                        def is_excluded_non_loss_key(key: str) -> bool:
+                            k_lower = key.lower()
+                            if k_lower in non_loss_keys:
+                                return True
+                            return any(
+                                k_lower == prefix or k_lower.startswith(f"{prefix}_")
+                                for prefix in non_loss_prefixes
+                            )
 
                         # First pass: try keys containing 'loss'
                         for k, v in loss_dict.items():
-                            if 'loss' in k.lower() and (isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1)):
+                            if (
+                                not is_excluded_non_loss_key(k)
+                                and 'loss' in k.lower()
+                                and (isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1))
+                            ):
                                 loss_value = v
                                 print_acc(f"[AlphaScheduler] Warning: Using loss key '{k}' (expected 'loss')")
                                 break
@@ -2707,8 +2732,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # Second pass: fallback to any scalar, excluding known non-loss keys
                         if loss_value is None:
                             for k, v in loss_dict.items():
-                                if (k.lower() not in non_loss_keys and
-                                    (isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1))):
+                                if (
+                                    not is_excluded_non_loss_key(k)
+                                    and (isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1))
+                                ):
                                     loss_value = v
                                     print_acc(f"[AlphaScheduler] Warning: Using non-loss key '{k}' as loss fallback")
                                     break
