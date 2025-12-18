@@ -561,14 +561,19 @@ class Wan2214bModel(Wan21):
             new_dict = {}
             for key in combined_dict:
                 # Check for both dot notation (.transformer_1.) and underscore notation (_transformer_1_)
+                new_key = key
                 if ".transformer_1." in key or "_transformer_1_" in key:
-                    # Normalize to no stage marker
-                    new_key = key.replace(".transformer_1.", ".").replace("_transformer_1_", "_")
+                    # Normalize to no stage marker - do dot notation first
+                    new_key = new_key.replace(".transformer_1.", ".")
+                    # Only replace underscore notation if still present after dot replacement
+                    if "_transformer_1_" in new_key:
+                        new_key = new_key.replace("_transformer_1_", "_")
                 elif ".transformer_2." in key or "_transformer_2_" in key:
-                    # Normalize to no stage marker
-                    new_key = key.replace(".transformer_2.", ".").replace("_transformer_2_", "_")
-                else:
-                    new_key = key
+                    # Normalize to no stage marker - do dot notation first
+                    new_key = new_key.replace(".transformer_2.", ".")
+                    # Only replace underscore notation if still present after dot replacement
+                    if "_transformer_2_" in new_key:
+                        new_key = new_key.replace("_transformer_2_", "_")
                 new_dict[new_key] = combined_dict[key]
             combined_dict = new_dict
 

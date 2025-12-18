@@ -459,7 +459,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     'sample_rate': self.optimizer._alpha_tracking_sample_rate,
                     'interval': self.optimizer._alpha_tracking_interval,
                     'sign_cache_limit': getattr(self.optimizer, '_alpha_tracking_cache_limit', 5000),
-                    'max_samples_per_param': 1024,
+                    'max_samples_per_param': getattr(self.optimizer, '_alpha_tracking_max_sign_samples', 1024),
                 }
 
             o_dict['optimizer_config'] = optimizer_meta
@@ -2691,18 +2691,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             loss_value = loss_dict[key]
                             break
 
-                    # Fallback: prefer keys containing 'loss', then any scalar
+                    # Fallback: prefer keys containing 'loss', then any scalar (excluding known non-loss keys)
                     if loss_value is None and len(loss_dict) > 0:
+                        # Known non-loss keys to exclude from fallback
+                        non_loss_keys = {'lr', 'learning_rate', 'epoch', 'step', 'global_step',
+                                        'iteration', 'batch_idx', 'rank', 'world_size'}
+
                         # First pass: try keys containing 'loss'
                         for k, v in loss_dict.items():
                             if 'loss' in k.lower() and (isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1)):
                                 loss_value = v
                                 print_acc(f"[AlphaScheduler] Warning: Using loss key '{k}' (expected 'loss')")
                                 break
-                        # Second pass: fallback to any scalar if no loss-like key found
+
+                        # Second pass: fallback to any scalar, excluding known non-loss keys
                         if loss_value is None:
                             for k, v in loss_dict.items():
-                                if isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1):
+                                if (k.lower() not in non_loss_keys and
+                                    (isinstance(v, (int, float)) or (torch.is_tensor(v) and v.numel() == 1))):
                                     loss_value = v
                                     print_acc(f"[AlphaScheduler] Warning: Using non-loss key '{k}' as loss fallback")
                                     break
