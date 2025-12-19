@@ -573,6 +573,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # always save params as ema
             self.ema.eval()
 
+        # CRITICAL FIX: Switch Schedule-Free optimizer to eval mode before checkpoint save
+        # This ensures we save the temporally-averaged z-weights instead of noisy y-weights
+        # See: SimpleTuner trainer.py:4607 and SCHEDULE_FREE_FIXES.md
+        optimizer_was_switched = False
+        if hasattr(self, 'optimizer') and self.optimizer is not None:
+            if hasattr(self.optimizer, 'eval') and callable(self.optimizer.eval):
+                print_acc("[Schedule-Free] Switching to eval mode before checkpoint save (using z-weights)")
+                self.optimizer.eval()
+                optimizer_was_switched = True
+
         if not os.path.exists(self.save_root):
             os.makedirs(self.save_root, exist_ok=True)
 
@@ -759,6 +769,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.ema is not None:
             self.ema.train()
+
+        # CRITICAL FIX: Switch Schedule-Free optimizer back to train mode after checkpoint save
+        # This resumes training with y-weights for gradient updates
+        # See: SimpleTuner trainer.py:4657 and SCHEDULE_FREE_FIXES.md
+        if optimizer_was_switched:
+            if hasattr(self, 'optimizer') and self.optimizer is not None:
+                if hasattr(self.optimizer, 'train') and callable(self.optimizer.train):
+                    print_acc("[Schedule-Free] Switching back to train mode after checkpoint save (using y-weights)")
+                    self.optimizer.train()
+
         flush()
 
     # Called before the model is loaded

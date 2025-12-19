@@ -2050,7 +2050,54 @@ class SDTrainer(BaseSDTrainProcess):
                 print_acc("[Schedule-Free] Switching to eval mode for sampling (using z-weights)")
                 self._logged_schedulefree_toggle = True
 
+            # Log weight statistics before eval
+            if hasattr(self.optimizer, 'param_groups') and self.optimizer.param_groups:
+                first_param = self.optimizer.param_groups[0]['params'][0]
+                mean_before = first_param.data.mean().item()
+                std_before = first_param.data.std().item()
+                print_acc(f"[Schedule-Free] Before eval() - param mean: {mean_before:.6f}, std: {std_before:.6f}")
+
             self.optimizer.eval()
+
+            # DIAGNOSTIC: Verify weight swap and tensor references
+            if hasattr(self.optimizer, 'param_groups') and self.optimizer.param_groups:
+                first_param_after = self.optimizer.param_groups[0]['params'][0]
+                mean_after = first_param_after.data.mean().item()
+                std_after = first_param_after.data.std().item()
+                mean_diff = abs(mean_after - mean_before)
+                std_diff = abs(std_after - std_before)
+
+                print_acc(f"[Schedule-Free] After eval() - param mean: {mean_after:.6f}, std: {std_after:.6f}")
+                print_acc(f"[Schedule-Free] Difference - mean: {mean_diff:.6f}, std: {std_diff:.6f}")
+
+                if mean_diff < 1e-7 and std_diff < 1e-7:
+                    print_acc("[Schedule-Free WARNING] No weight change detected after eval() - might indicate issue!")
+
+            # DIAGNOSTIC: Check tensor reference alignment
+            if hasattr(self, 'network') and hasattr(self.network, 'parameters'):
+                try:
+                    net_params = list(self.network.parameters())
+                    if net_params and hasattr(self.optimizer, 'param_groups') and self.optimizer.param_groups:
+                        first_net_param = net_params[0]
+                        first_opt_group = self.optimizer.param_groups[0]
+                        if 'params' in first_opt_group and first_opt_group['params']:
+                            first_opt_param = first_opt_group['params'][0]
+
+                            # Check if they're the same tensor (same memory address)
+                            same_tensor = (first_net_param.data_ptr() == first_opt_param.data_ptr())
+
+                            print_acc(f"[Schedule-Free Debug] Network param ptr: {first_net_param.data_ptr()}")
+                            print_acc(f"[Schedule-Free Debug] Optimizer param ptr: {first_opt_param.data_ptr()}")
+                            print_acc(f"[Schedule-Free Debug] Same tensor reference: {same_tensor}")
+
+                            if not same_tensor:
+                                print_acc("[Schedule-Free WARNING] ⚠️  Network and optimizer have DIFFERENT tensor references!")
+                                print_acc("[Schedule-Free WARNING] ⚠️  Weight swapping may not be visible to network!")
+                                print_acc("[Schedule-Free WARNING] ⚠️  This could explain generic/wrong faces in samples!")
+                            else:
+                                print_acc("[Schedule-Free] ✓ Tensor references match - weight swap should be visible")
+                except Exception as e:
+                    print_acc(f"[Schedule-Free Debug] Could not verify tensor references: {e}")
 
     def hook_after_sample(self):
         """Switch Schedule-Free optimizer back to train mode.

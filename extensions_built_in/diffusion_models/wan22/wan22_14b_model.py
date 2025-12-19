@@ -577,6 +577,10 @@ class Wan2214bModel(Wan21):
                 new_dict[new_key] = combined_dict[key]
             combined_dict = new_dict
 
+        # BUGFIX: The original key conversion was too aggressive and corrupted keys
+        # It would convert "diffusion_model.transformer_1." to "diffusion_model_transformer_1_"
+        # which breaks the key format and prevents weights from loading
+        # REMOVED - let convert_lora_weights_before_load() handle key format conversion
         return combined_dict
     
     def generate_single_image(
