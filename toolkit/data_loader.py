@@ -427,6 +427,29 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 # only look for videos
                 extensions = video_extensions
             file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions))]
+
+            # Exclude common non-training subfolders (caches, controls, masks) that often live alongside datasets.
+            # This prevents accidentally training on mask images (e.g. <dataset>/masks/*.png) and on cache artifacts.
+            skip_dirnames = {
+                "_controls",
+                "_t_e_cache",
+                "_latent_cache",
+                ".ipynb_checkpoints",
+            }
+            if self.dataset_config.mask_path is not None or self.dataset_config.alpha_mask:
+                # If masks are enabled, it's especially common to have a sibling "mask(s)" folder under the dataset.
+                skip_dirnames.update({"mask", "masks"})
+
+            def _should_skip(path: str) -> bool:
+                rel = os.path.relpath(path, self.dataset_path)
+                parts = rel.split(os.sep)
+                return any(part in skip_dirnames for part in parts[:-1])
+
+            original_len = len(file_list)
+            file_list = [p for p in file_list if not _should_skip(p)]
+            skipped = original_len - len(file_list)
+            if skipped:
+                print_acc(f"  -  Skipping {skipped} files in excluded subfolders: {sorted(skip_dirnames)}")
         else:
             # assume json
             with open(self.dataset_path, 'r') as f:

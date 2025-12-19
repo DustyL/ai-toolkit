@@ -1137,6 +1137,14 @@ class DatasetConfig:
         self.alpha_mask: bool = kwargs.get('alpha_mask', False)  # if true, will use alpha channel as mask
         self.mask_path: str = kwargs.get('mask_path',
                                          None)  # focus mask (black and white. White has higher loss than black)
+        if self.mask_path == '':
+            self.mask_path = None
+        if self.mask_path is not None and not os.path.isdir(self.mask_path):
+            raise FileNotFoundError(
+                f"DatasetConfig.mask_path must be an existing directory, got: {self.mask_path}. "
+                "If you intended to train without masks, remove mask_path from the dataset config. "
+                "If you intended to use alpha masks, set alpha_mask: true and omit mask_path."
+            )
         self.unconditional_path: str = kwargs.get('unconditional_path',
                                                   None)  # path where matching unconditional images are located
         self.invert_mask: bool = kwargs.get('invert_mask', False)  # invert mask
