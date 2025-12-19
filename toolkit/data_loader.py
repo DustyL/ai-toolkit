@@ -582,19 +582,6 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 if os.path.exists(te_path):
                     file_item.is_text_embedding_cached = True
                     file_item._text_embedding_path = te_path
-                else:
-                    # Fallback: accept any cached safetensor with the same basename prefix
-                    base = os.path.splitext(os.path.basename(file_item.path))[0]
-                    fallback_dir = os.path.join(os.path.dirname(file_item.path), "_t_e_cache")
-                    if os.path.isdir(fallback_dir):
-                        import glob
-                        candidates = glob.glob(os.path.join(fallback_dir, f"{base}_*.safetensors"))
-                        if len(candidates) > 0:
-                            # pick the most recent
-                            candidates.sort(key=os.path.getmtime, reverse=True)
-                            file_item._text_embedding_path = candidates[0]
-                            file_item.is_text_embedding_cached = True
-                            print_acc(f"[TE CACHE] Fallback matched {base} -> {candidates[0]}")
             except Exception:
                 # if anything goes wrong, continue without marking
                 pass
