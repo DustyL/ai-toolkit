@@ -414,14 +414,16 @@ class CaptionProcessingDTOMixin:
                         new_token_list.append(token)
             token_list = new_token_list
 
-        if self.dataset_config.shuffle_tokens:
+        # When caching text embeddings, prompts must be deterministic; avoid random shuffles.
+        if self.dataset_config.shuffle_tokens and not self.dataset_config.cache_text_embeddings:
             random.shuffle(token_list)
 
         # join back together
         caption = ', '.join(token_list)
         caption = inject_trigger_into_prompt(caption, trigger, to_replace_list, add_if_not_present)
 
-        if self.dataset_config.random_triggers:
+        # When caching text embeddings, prompts must be deterministic; avoid random triggers.
+        if self.dataset_config.random_triggers and not self.dataset_config.cache_text_embeddings:
             num_triggers = self.dataset_config.random_triggers_max
             if num_triggers > 1:
                 num_triggers = random.randint(0, num_triggers)
@@ -435,7 +437,8 @@ class CaptionProcessingDTOMixin:
                 #     trigger = self.dataset_config.random_triggers[int(random.random() * (len(self.dataset_config.random_triggers)))]
                 #     caption = caption + ', ' + trigger
 
-        if self.dataset_config.shuffle_tokens:
+        # When caching text embeddings, prompts must be deterministic; avoid random shuffles.
+        if self.dataset_config.shuffle_tokens and not self.dataset_config.cache_text_embeddings:
             # shuffle again
             token_list = caption.split(',')
             # trim whitespace
@@ -1815,13 +1818,14 @@ class TextEmbeddingFileItemDTOMixin:
 
     def get_text_embedding_info_dict(self: 'FileItemDTO'):
         # make sure the caption is loaded here
-        # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
-        if self.raw_caption is None:
+        # TODO: we need a way to cache all the other features like trigger words, DOP, etc.
+        # Captions are deterministic when cache_text_embeddings is enabled (randomization paths are disabled).
+        if self.caption is None:
             self.load_caption()
-        # Use raw_caption for hash stability - processed caption (shuffle_tokens, dropout)
-        # changes each run, but we want consistent cache keys based on the original caption
         item = OrderedDict([
-            ("caption", self.raw_caption if self.raw_caption else ''),
+            # IMPORTANT: Use processed caption (includes trigger_word injection) so cached embeddings
+            # reflect the exact conditioning used during training.
+            ("caption", self.caption),
             ("text_embedding_space_version", self.text_embedding_space_version),
             ("text_embedding_version", self.text_embedding_version),
         ])
@@ -1844,15 +1848,6 @@ class TextEmbeddingFileItemDTOMixin:
             hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
             hash_str = hash_str.replace('=', '')
             self._text_embedding_path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
-            # If recalculate is False and the exact hash file is missing, accept any prefix match
-            if not recalculate and not os.path.exists(self._text_embedding_path):
-                import glob
-                candidates = glob.glob(os.path.join(te_dir, f"{filename_no_ext}_*.safetensors"))
-                if len(candidates) > 0:
-                    candidates.sort(key=os.path.getmtime, reverse=True)
-                    self._text_embedding_path = candidates[0]
-                    self.is_text_embedding_cached = True
-                    print_acc(f"[TE CACHE] Fallback (get_text_embedding_path) matched {filename_no_ext} -> {self._text_embedding_path}")
 
         return self._text_embedding_path
 
@@ -1881,6 +1876,8 @@ class TextEmbeddingCachingMixin:
         batch_size = max(1, int(os.environ.get("AITK_TE_CACHE_BATCH", "1")))
 
         def process_single(fi: 'FileItemDTO'):
+            if fi.caption is None:
+                fi.load_caption()
             text_embedding_path = fi.get_text_embedding_path(recalculate=True)
             if os.path.exists(text_embedding_path):
                 fi.is_text_embedding_cached = True
@@ -1911,11 +1908,9 @@ class TextEmbeddingCachingMixin:
                     ctrl_img = ctrl_img_list[0]
                 else:
                     ctrl_img = ctrl_img_list
-                # Use raw_caption for caching to match hash calculation
-                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(fi.raw_caption, control_images=ctrl_img)
+                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(fi.caption, control_images=ctrl_img)
             else:
-                # Use raw_caption for caching to match hash calculation
-                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(fi.raw_caption)
+                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(fi.caption)
             prompt_embeds.save(text_embedding_path)
             del prompt_embeds
             fi.is_text_embedding_cached = True
